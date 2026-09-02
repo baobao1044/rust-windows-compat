@@ -10,12 +10,12 @@ this project's test harness. Empty cells mean not-yet-reached.
 | Minimal PE (exit code) | ✅ M0 | `mov eax,42; ret` — runs natively via nigg-loader, exits 42 |
 | PE importing kernel32 (ExitProcess) | ✅ M1 | PE calls `kernel32!ExitProcess(42)` via Win64→SysV ABI thunk, exits 42 |
 | Console PE (WriteFile + ExitProcess) | ✅ M2 | PE prints "hello" via `WriteFile` to stdout, exits 0 |
-| Rust-std console (hello.exe) | 🚧 M2 stretch | needs ~180 imports (Winsock, CRT, etc.) — 53/180 implemented |
+| Rust-std console (hello.exe) | ✅ M7c | ~180 imports (Winsock, CRT, etc.) — all implemented via CRT expansion + soft-stub mode; `hello from windows binary` prints, exits 0 |
 | Win32 GUI (window + message loop) | ✅ M3 | user32 RegisterClass/CreateWindow/GetMessage/DispatchMessage — headless-safe unit test; wired into pe-loader imports |
 | D3D11 clear+triangle (Rust-native) | ✅ M6b | DXGI swap chain + D3D11 device over Vulkan; HLSL→SPIR-V; clear red + green triangle — verified via `clear_triangle` example |
-| D3D11 sample via nigg-loader (PE) | 🚧 M7a | COM vtable for D3D11/DXGI in progress |
+| D3D11 sample via nigg-loader (PE) | ✅ M7c | COM vtable for D3D11/DXGI — d3d11_sample.exe + d3d11_triangle.exe both run through nigg-loader, exit 0 |
 | D3D11 indie game | — | M7 |
-| D3D12 sample | — | M8 |
+| D3D12 sample | — | M8 (in progress) |
 | Modern D3D11/12 game | — | M9 north star |
 | .NET / WPF app | — | out of initial scope; needs CLR translation |
 
@@ -50,20 +50,24 @@ this project's test harness. Empty cells mean not-yet-reached.
 - Inline-asm trampolines: register shuffle (RCX→RDI, RDX→RSI, R8→RDX, R9→RCX), stack arg repositioning, shadow space. Supports up to 32 args.
 - `run_entrypoint_win64`: calls PE entrypoint with RCX=PEB, 32-byte shadow space.
 
-### ntdll / ntapi (M1)
+### ntdll / ntapi (M1, M7c)
 - Memory: VirtualAlloc/Free/Protect/Query (mmap/munmap/mprotect).
 - Sync (futex-based): CRITICAL_SECTION (recursive), Event (auto/manual reset), Mutex (recursive), Semaphore, SRWLock, Sleep/WaitForSingleObject/MultipleObjects.
 - Threads: CreateThread, GetCurrentThread/Process/Id, TLS (TlsAlloc/Get/Set/Free).
 - Time: GetTickCount/64, QueryPerformanceCounter/Frequency.
 - Process: ExitProcess/NtTerminateProcess, GetStdHandle/WriteFile/ReadFile, GetLastError/SetLastError.
+- Files: NtWriteFile/NtReadFile (real stdout/stdin path for Rust std; fill IO_STATUS_BLOCK).
 
-### kernel32 / win32-kernel32 (M2)
+### kernel32 / win32-kernel32 (M2, M7c)
 - Console: GetStdHandle, WriteFile/ReadFile, WriteConsoleW/A, GetConsoleMode/SetConsoleMode.
 - Files: CreateFileW/A, ReadFile/WriteFile, CloseHandle, GetFileSize, SetFilePointer, FlushFileBuffers.
 - Heap: GetProcessHeap, HeapAlloc/Free/ReAlloc/Create/Destroy (libc malloc-backed).
 - Environment: Get/SetEnvironmentVariableW, GetEnvironmentStringsW/Free.
 - Process: GetCurrentProcessId/ThreadId, GetModuleHandleW/A, GetCommandLineW/A.
 - String: MultiByteToWideChar/WideCharToMultiByte, lstrlenW/A, lstrcpyW/lstrcatW.
+- CRT (msvcrt, M7c): malloc/calloc/free/realloc, strlen/strncmp/memcmp, fprintf/vfprintf, __getmainargs/__initenv/__set_app_type/__setusermatherr/_amsg_exit/_cexit/_commode/_fmode/_fpreset/_initterm/atexit/abort/exit/signal.
+- Extras (M7c): InitOnceBeginInitialize/Complete (tracks completed INIT_ONCE by address), AddVectoredExceptionHandler, GetSystemTimePreciseAsFileTime, WaitOnAddress/WakeByAddressAll/WakeByAddressSingle, ProcessPrng, RtlCaptureContext.
+- Soft-stub mode (NIGG_SOFT_STUBS=1): unimplemented imports get a no-op that logs once and returns 0, so CRT init survives calls to unimplemented APIs.
 
 ### user32 / win32-user32 (M3)
 - Window class: RegisterClassExW, UnregisterClassW.
