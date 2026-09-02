@@ -1,0 +1,18 @@
+[package]
+name = "nigg-d3d12-com"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# COM vtable layer for D3D12 (workstream M8b). Wraps the existing Rust-native
+# `nigg-d3d12`/`nigg-dxgi` Vulkan translation in COM objects whose vtable slots
+# are Win64->SysV ABI thunks, so a Windows PE can call D3D12 through real vtables
+# end-to-end. The thunk memory itself is owned by the PE loader's `ThunkArena`;
+# this crate receives a thunk-creation callback (`install_vtables`) so it has no
+# dependency on the loader crate (avoids a workspace dependency cycle). This
+# mirrors `nigg-d3d11-com` exactly, only for the D3D12 device/command-list API.
+
+[dependencies]
+nigg-d3d12 = { path = "../d3d12" }
+nigg-dxgi = { path = "../dxgi" }
+log.workspace = true

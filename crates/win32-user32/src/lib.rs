@@ -62,15 +62,25 @@ pub struct Msg {
 /// `LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM)`.
 pub type WndProc = *const c_void;
 
-/// Minimal `WNDCLASSEXW` fields we capture at registration time.
+/// The Windows `WNDCLASSEXW` structure as a PE lays it out (80 bytes on x64).
+/// We mirror the full field layout so a PE's `&WNDCLASSEXW` pointer is read
+/// correctly — a partial struct would misalign every field after the first
+/// gap, and `lpszClassName` (at offset 64) would read from the wrong place.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WndClassEx {
+    pub cb_size: u32,
     pub style: u32,
     pub lpfn_wnd_proc: WndProc,
     pub cb_cls_extra: c_int,
     pub cb_wnd_extra: c_int,
     pub h_instance: *mut c_void,
+    pub h_icon: *mut c_void,
+    pub h_cursor: *mut c_void,
+    pub hbr_background: *mut c_void,
+    pub lpsz_menu_name: *const u16,
     pub lpsz_class_name: *const u16,
+    pub h_icon_sm: *mut c_void,
 }
 
 // ---------------------------------------------------------------------------
@@ -880,12 +890,18 @@ mod tests {
         // A class name as a NUL-terminated wide string on the stack.
         let name: Vec<u16> = "TestWnd\0".encode_utf16().collect();
         let wcx = WndClassEx {
+            cb_size: core::mem::size_of::<WndClassEx>() as u32,
             style: 0,
             lpfn_wnd_proc: std::ptr::null(),
             cb_cls_extra: 0,
             cb_wnd_extra: 0,
             h_instance: std::ptr::null_mut(),
+            h_icon: std::ptr::null_mut(),
+            h_cursor: std::ptr::null_mut(),
+            hbr_background: std::ptr::null_mut(),
+            lpsz_menu_name: std::ptr::null(),
             lpsz_class_name: name.as_ptr(),
+            h_icon_sm: std::ptr::null_mut(),
         };
         let atom = register_class_ex_w(&wcx);
         assert_ne!(atom, 0, "RegisterClassExW must return a nonzero atom");
@@ -906,12 +922,18 @@ mod tests {
         // by setting wnd_proc to null so DispatchMessageW defers to DefWindowProcW).
         let name: Vec<u16> = "LoopWnd\0".encode_utf16().collect();
         let wcx = WndClassEx {
+            cb_size: core::mem::size_of::<WndClassEx>() as u32,
             style: 0,
             lpfn_wnd_proc: std::ptr::null(), // DefWindowProc path
             cb_cls_extra: 0,
             cb_wnd_extra: 0,
             h_instance: std::ptr::null_mut(),
+            h_icon: std::ptr::null_mut(),
+            h_cursor: std::ptr::null_mut(),
+            hbr_background: std::ptr::null_mut(),
+            lpsz_menu_name: std::ptr::null(),
             lpsz_class_name: name.as_ptr(),
+            h_icon_sm: std::ptr::null_mut(),
         };
         let atom = register_class_ex_w(&wcx);
         assert_ne!(atom, 0);
@@ -973,12 +995,18 @@ mod tests {
     fn get_client_rect_reflects_cached_size() {
         let name: Vec<u16> = "RectWnd\0".encode_utf16().collect();
         let wcx = WndClassEx {
+            cb_size: core::mem::size_of::<WndClassEx>() as u32,
             style: 0,
             lpfn_wnd_proc: std::ptr::null(),
             cb_cls_extra: 0,
             cb_wnd_extra: 0,
             h_instance: std::ptr::null_mut(),
+            h_icon: std::ptr::null_mut(),
+            h_cursor: std::ptr::null_mut(),
+            hbr_background: std::ptr::null_mut(),
+            lpsz_menu_name: std::ptr::null(),
             lpsz_class_name: name.as_ptr(),
+            h_icon_sm: std::ptr::null_mut(),
         };
         let _atom = register_class_ex_w(&wcx);
         let hwnd = create_window_ex_w(

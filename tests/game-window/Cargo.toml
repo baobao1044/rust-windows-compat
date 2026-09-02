@@ -1,0 +1,27 @@
+[package]
+name = "nigg-game-window"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# M7+ game-window sample PE. A `#![no_std]`/`#![no_main]` Windows program that
+# registers a window class, creates a window, initializes D3D11 with a swap
+# chain attached to that HWND, runs one frame (clear + present), and exits.
+# Standalone workspace so its own profiles apply.
+
+[[bin]]
+name = "game_window"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+# Standalone workspace so the parent workspace's profiles do not override
+# `panic = "abort"` (workspace members inherit the root's profiles).
+[workspace]
