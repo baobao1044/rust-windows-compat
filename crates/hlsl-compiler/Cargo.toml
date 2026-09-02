@@ -1,0 +1,18 @@
+[package]
+name = "nigg-hlsl-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rspirv.workspace = true
+thiserror.workspace = true
+log.workspace = true
+clap.workspace = true
+
+[lib]
+name = "nigg_hlsl_compiler"
+
+[[bin]]
+name = "nigg-hlslc"
+path = "src/bin/nigg-hlslc.rs"

@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pe-loader",
+    "crates/runtime",
+    "crates/ntapi",
+    "crates/win32-kernel32",
+    "crates/win32-user32",
+    "crates/win32-gdi32",
+    "crates/wsi",
+    "crates/input",
+    "crates/audio",
+    "crates/dxgi",
+    "crates/d3d11",
+    "crates/d3d12",
+    "crates/hlsl-compiler",
+    "crates/tests",
+    "tests/fixtures",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/baobao1044/nigg"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Format/PE parsing (parser bindings, not Windows-compat code)
+goblin = { version = "0.9", default-features = false, features = ["std", "pe32", "pe64"] }
+pelite = "0.10"
+
+# Vulkan binding (calls the system Vulkan loader, not Windows-compat code)
+ash = "0.38"
+
+# Display server bindings (X11 / Wayland)
+x11rb = "0.13"
+smithay-client-toolkit = "0.19"
+
+# Input
+evdev = "0.12"
+gilrs = "0.10"
+
+# Audio (PipeWire / cpal)
+cpal = "0.15"
+pipewire = "0.8"
+
+# SPIR-V IR emission (pure-Rust SPIR-V module builder)
+rspirv = "0.12"
+spirv-tools = { version = "0.11", default-features = false }
+
+# General
+log = "0.4"
+env_logger = "0.11"
+thiserror = "1"
+bitflags = "2"
+parking_lot = "0.12"
+memoffset = "0.9"
+memmap2 = "0.9"
+byteorder = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

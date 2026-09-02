@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libvulkan-dev libpipewire-0.3-dev libasound2-dev
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets
+      - name: build (linux)
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace
+      - name: cross-compile test fixtures (windows-gnu)
+        run: cargo build --target x86_64-pc-windows-gnu -p nigg-tests-fixtures

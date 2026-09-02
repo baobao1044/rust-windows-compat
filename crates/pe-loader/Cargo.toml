@@ -1,0 +1,20 @@
+[package]
+name = "nigg-pe-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+goblin.workspace = true
+pelite.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+log.workspace = true
+clap.workspace = true
+
+[lib]
+name = "nigg_pe_loader"
+
+[[bin]]
+name = "nigg-loader"
+path = "src/bin/nigg-loader.rs"

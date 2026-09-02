@@ -1,0 +1,12 @@
+/target
+**/target
+Cargo.lock
+.zcode/
+*.exe
+*.pdb
+*.dll
+*.log
+.idea/
+.vscode/
+*.swp
+.DS_Store
