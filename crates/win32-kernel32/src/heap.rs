@@ -77,6 +77,7 @@ const HEADER_SIZE: usize = std::mem::size_of::<usize>();
 /// the requested size in a header word just before the returned payload pointer. `dwFlags`
 /// may set `HEAP_ZERO_MEMORY` (0x08), in which case the payload is zeroed.
 pub extern "C" fn heap_alloc(_heap: Handle, flags: u32, bytes: usize) -> *mut c_void {
+    eprintln!("[nigg heap] HeapAlloc(bytes={bytes})");
     const HEAP_ZERO_MEMORY: u32 = 0x08;
     let total = bytes.saturating_add(HEADER_SIZE);
     // SAFETY: `libc::malloc(total)` returns a valid pointer to `total` bytes or NULL.

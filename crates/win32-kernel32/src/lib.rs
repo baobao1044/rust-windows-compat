@@ -39,7 +39,9 @@
 use std::os::raw::c_void;
 
 pub mod console;
+pub mod crt;
 pub mod env;
+pub mod extras;
 pub mod file;
 pub mod heap;
 pub mod process;

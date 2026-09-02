@@ -168,6 +168,7 @@ pub extern "C" fn write_console_a(
 /// mode for the handle into `lpMode`. Stdio handles have a default mode; other handles
 /// return FALSE (they are not consoles).
 pub extern "C" fn get_console_mode(handle: Handle, mode: *mut u32) -> i32 {
+    eprintln!("[nigg console] GetConsoleMode(handle={handle})");
     let modes = console_modes().lock();
     if let Some(&m) = modes.get(&handle) {
         if !mode.is_null() {

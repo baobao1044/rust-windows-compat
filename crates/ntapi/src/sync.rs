@@ -725,6 +725,130 @@ impl Object {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WaitOnAddress / WakeByAddress (api-ms-win-core-synch-l1-2-0)
+// ---------------------------------------------------------------------------
+
+/// `WaitOnAddress(addr, compare, size, timeout_ms) -> BOOL`. Blocks while the value at
+/// `addr` equals the value at `compare` (for `size` bytes: 1/2/4/8). Uses the Linux futex
+/// for 4-byte values; for other sizes it polls. Returns TRUE if the value changed (or was
+/// already different), FALSE on timeout.
+pub extern "C" fn wait_on_address(
+    addr: *mut c_void,
+    compare: *const c_void,
+    size: usize,
+    timeout_ms: u32,
+) -> i32 {
+    if addr.is_null() || compare.is_null() {
+        return 0; // FALSE
+    }
+    let deadline = deadline_ns(timeout_ms);
+    match size {
+        4 => {
+            // SAFETY: `addr` and `compare` are valid for 4-byte reads/writes.
+            let a = unsafe { &*(addr as *const AtomicU32) };
+            let expected = unsafe { std::ptr::read_unaligned(compare as *const u32) };
+            loop {
+                if a.load(Ordering::Acquire) != expected {
+                    return 1; // TRUE: value changed
+                }
+                let remaining = match deadline {
+                    Some(d) => {
+                        let now = monotonic_ns();
+                        if now >= d {
+                            return 0; // FALSE: timeout
+                        }
+                        Some(d - now)
+                    }
+                    None => None,
+                };
+                crate::futex::futex_wait(a, expected, remaining);
+            }
+        }
+        8 => {
+            // 8-byte wait: poll with a short sleep (futex only supports 4 bytes).
+            // SAFETY: 8-byte reads at `addr` and `compare`.
+            loop {
+                let cur = unsafe { std::ptr::read_unaligned(addr as *const u64) };
+                let exp = unsafe { std::ptr::read_unaligned(compare as *const u64) };
+                if cur != exp {
+                    return 1; // TRUE
+                }
+                let remaining = match deadline {
+                    Some(d) => {
+                        let now = monotonic_ns();
+                        if now >= d {
+                            return 0; // FALSE: timeout
+                        }
+                        Some((d - now).min(1_000_000))
+                    }
+                    None => Some(1_000_000), // poll every 1ms
+                };
+                if let Some(ns) = remaining {
+                    nanosleep_ns(ns);
+                }
+            }
+        }
+        1 | 2 => {
+            // 1/2-byte wait: poll.
+            // SAFETY: reads of `size` bytes at `addr` and `compare`.
+            loop {
+                let cur = unsafe {
+                    if size == 1 {
+                        std::ptr::read_unaligned(addr as *const u8) as u64
+                    } else {
+                        std::ptr::read_unaligned(addr as *const u16) as u64
+                    }
+                };
+                let exp = unsafe {
+                    if size == 1 {
+                        std::ptr::read_unaligned(compare as *const u8) as u64
+                    } else {
+                        std::ptr::read_unaligned(compare as *const u16) as u64
+                    }
+                };
+                if cur != exp {
+                    return 1; // TRUE
+                }
+                let remaining = match deadline {
+                    Some(d) => {
+                        let now = monotonic_ns();
+                        if now >= d {
+                            return 0; // FALSE: timeout
+                        }
+                        Some((d - now).min(1_000_000))
+                    }
+                    None => Some(1_000_000),
+                };
+                if let Some(ns) = remaining {
+                    nanosleep_ns(ns);
+                }
+            }
+        }
+        _ => 0, // FALSE: unsupported size
+    }
+}
+
+/// `WakeByAddressSingle(addr) -> void`. Wakes one waiter blocked on `addr` via futex.
+pub extern "C" fn wake_by_address_single(addr: *mut c_void) {
+    if addr.is_null() {
+        return;
+    }
+    // SAFETY: `addr` is a valid futex word address (4-byte aligned for the wait path).
+    let a = unsafe { &*(addr as *const AtomicU32) };
+    crate::futex::futex_wake(a, 1);
+}
+
+/// `WakeByAddressAll(addr) -> void`. Wakes all waiters blocked on `addr`.
+pub extern "C" fn wake_by_address_all(addr: *mut c_void) {
+    if addr.is_null() {
+        return;
+    }
+    // SAFETY: `addr` is a valid futex word address.
+    let a = unsafe { &*(addr as *const AtomicU32) };
+    crate::futex::futex_wake(a, i32::MAX);
+}
+
 /// Silence unused-import warning for `Duration` (kept for future timeout math).
 #[allow(dead_code)]
 fn _duration_used() {

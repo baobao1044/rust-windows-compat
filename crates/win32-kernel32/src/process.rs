@@ -43,6 +43,7 @@ pub extern "C" fn exit_process(exit_code: u32) -> ! {
 /// fake EXE base; with a known DLL name (`kernel32.dll`, `ntdll.dll`) returns a stable
 /// fake base for that DLL; an unknown name returns NULL.
 pub extern "C" fn get_module_handle_w(module_name: *const u16) -> Hmodule {
+    eprintln!("[nigg process] GetModuleHandleW");
     // SAFETY: `module_name` is a NUL-terminated UTF-16 buffer (or null).
     let name = unsafe { crate::string::utf16_to_string(module_name) };
     resolve_module_handle(&name)

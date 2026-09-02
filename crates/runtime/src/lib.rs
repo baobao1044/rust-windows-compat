@@ -253,6 +253,12 @@ pub unsafe fn run_entrypoint(entry: *const (), stack_top: *mut u8) -> i32 {
 /// (`mov eax,42; ret`) ignores all arguments, so it keeps working under this calling
 /// convention.
 ///
+/// Before calling the entrypoint, this installs a SIGSEGV/SIGILL handler that catches the
+/// Windows `__fastfail` instruction (`int $0x29` with the error code in ECX). On Linux that
+/// instruction raises SIGSEGV (it is not a valid syscall); the handler reads the error code
+/// from the saved RCX and exits cleanly so any panic message the guest already wrote to
+/// stderr is visible instead of being lost to a raw segfault.
+///
 /// # Safety
 ///
 /// `entry` must point to valid, executable, position-appropriate machine code (a mapped PE
@@ -262,6 +268,8 @@ pub unsafe fn run_entrypoint(entry: *const (), stack_top: *mut u8) -> i32 {
 /// (the loader supplies the live PEB). The caller upholds these by passing the loader's
 /// resolved entrypoint, a freshly allocated [`Stack::top`], and the TEB/PEB's PEB address.
 pub unsafe fn run_entrypoint_win64(entry: *const (), stack_top: *mut u8, peb: *mut ()) -> i32 {
+    install_fastfail_handler();
+
     let mut result: i32;
 
     // We reserve 32 bytes of shadow space at [stack_top - 0x20, stack_top). The `call` then
@@ -328,6 +336,81 @@ impl fmt::Display for BootstrapError {
 fn round_up_to_page(n: usize) -> usize {
     let page = page_size();
     (n + page - 1) & !(page - 1)
+}
+
+// ---------------------------------------------------------------------------
+// Windows __fastfail (`int $0x29`) signal handler
+// ---------------------------------------------------------------------------
+
+/// Install a SIGSEGV/SIGILL handler that catches the Windows `__fastfail` instruction
+/// (`int $0x29`, opcode `cd 29`) and translates it to a clean process exit. On Windows the
+/// kernel handles `int $0x29` directly; on Linux it raises SIGSEGV, which would dump core
+/// and lose any panic message the guest already wrote. The handler reads the fast-fail
+/// reason code from the saved RCX (the Windows `__fastfail` convention) and exits with a
+/// distinct code so the loader can report it.
+fn install_fastfail_handler() {
+    // SAFETY: `sigaction` installs a signal handler; the handler itself only reads the
+    // saved register context and calls `_exit`, which is async-signal-safe.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = fastfail_handler as *const () as usize;
+        // SA_SIGINFO so we get the ucontext with the saved registers; SA_RESTART is not
+        // needed since we never return from the handler.
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGILL, &sa, std::ptr::null_mut());
+    }
+}
+
+/// The `__fastfail` signal handler. If the faulting instruction is `int $0x29` (the Windows
+/// fast-fail opcode), it reads the reason code from RCX and exits cleanly. Otherwise it
+/// re-raises the signal with the default handler so genuine crashes still produce a core
+/// dump.
+extern "C" fn fastfail_handler(
+    _sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ucontext: *mut libc::ucontext_t,
+) {
+    if ucontext.is_null() {
+        return;
+    }
+    // SAFETY: `ucontext` points to a valid ucontext_t filled by the kernel on signal entry.
+    let uc = unsafe { &mut *ucontext };
+    let rip = uc.uc_mcontext.gregs[libc::REG_RIP as usize] as *const u8;
+
+    // Check if the faulting instruction is `int $0x29` (bytes: CD 29).
+    // SAFETY: `rip` is the instruction pointer that faulted; reading 2 bytes is safe if the
+    // page is mapped (it was executing code from it).
+    let is_fastfail = if !rip.is_null() {
+        let bytes = unsafe { std::slice::from_raw_parts(rip, 2) };
+        bytes == [0xCD, 0x29]
+    } else {
+        false
+    };
+
+    if is_fastfail {
+        // Read the fast-fail reason code from RCX (Windows __fastfail convention).
+        let rcx = uc.uc_mcontext.gregs[libc::REG_RCX as usize] as u32;
+        eprintln!("nigg-loader: guest invoked __fastfail({rcx}) (Windows abort); exiting");
+        // Flush stderr so the message (and any prior panic text) is visible.
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        // SAFETY: `_exit` is async-signal-safe and never returns.
+        unsafe { libc::_exit(0xC000_0409u32 as i32) }; // STATUS_STACK_BUFFER_OVERRUN sentinel
+    }
+
+    // Not a fast-fail: re-raise the default handler so genuine segfaults still dump core.
+    // SAFETY: resetting SIGSEGV/SIGILL to SIG_DFL and re-raising is the standard "die with a
+    // core dump" path.
+    unsafe {
+        libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+        libc::signal(libc::SIGILL, libc::SIG_DFL);
+        libc::raise(if info.is_null() {
+            libc::SIGSEGV
+        } else {
+            (*info).si_signo
+        });
+    }
 }
 
 fn page_size() -> usize {

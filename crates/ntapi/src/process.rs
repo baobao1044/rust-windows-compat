@@ -277,6 +277,126 @@ pub fn open_file_handle(path: &std::ffi::CString, flags: i32, mode: u32) -> Hand
     handle::create(Object::File(FileObject { fd }))
 }
 
+// ---------------------------------------------------------------------------
+// NtReadFile / NtWriteFile — used by the Rust std `Handle` synchronous I/O path.
+//
+// `IO_STATUS_BLOCK` is `#[repr(C)] { Anonymous: union { Status: NTSTATUS (i32),
+// Pointer: *mut c_void }, Information: usize }` — 16 bytes on x64. The guest passes
+// a pointer to one; we write the final NTSTATUS into `Status` and the byte count
+// into `Information`, then return the NTSTATUS. Synchronous (no Event/Apc) I/O
+// completes inline and returns STATUS_SUCCESS (0) on success.
+// ---------------------------------------------------------------------------
+
+/// `ntdll!NtWriteFile(handle, event, apc, apc_ctx, io_status, buf, len, byte_offset, key)
+/// -> NTSTATUS`. Performs a synchronous write for stdio/file handles and fills the
+/// `IO_STATUS_BLOCK`. Async I/O (non-null `event`/`apc`) is treated as synchronous.
+pub extern "C" fn nt_write_file(
+    handle: Handle,
+    _event: Handle,
+    _apc: *mut c_void,
+    _apc_ctx: *mut c_void,
+    io_status: *mut c_void,
+    buf: *const u8,
+    len: u32,
+    _byte_offset: *const i64,
+    _key: *const u32,
+) -> i32 {
+    let fd = resolve_fd(handle);
+    if fd < 0 || buf.is_null() {
+        set_nt_status(io_status, 0xC000_0008u32 as i32); // STATUS_INVALID_HANDLE
+        return 0xC000_0008u32 as i32;
+    }
+    // SAFETY: the guest passes a buffer valid for `len` bytes (Windows contract).
+    let n = unsafe { libc::write(fd, buf as *const c_void, len as usize) };
+    if n < 0 {
+        let status = errno_to_nt();
+        set_nt_status(io_status, status);
+        return status;
+    }
+    set_io_status(io_status, 0, n as usize); // STATUS_SUCCESS, bytes written
+    0 // STATUS_SUCCESS
+}
+
+/// `ntdll!NtReadFile(handle, event, apc, apc_ctx, io_status, buf, len, byte_offset, key)
+/// -> NTSTATUS`. Performs a synchronous read for stdio/file handles and fills the
+/// `IO_STATUS_BLOCK`. Returns STATUS_END_OF_FILE (0xC0000011) for a zero-length read
+/// on a terminal EOF.
+pub extern "C" fn nt_read_file(
+    handle: Handle,
+    _event: Handle,
+    _apc: *mut c_void,
+    _apc_ctx: *mut c_void,
+    io_status: *mut c_void,
+    buf: *mut u8,
+    len: u32,
+    _byte_offset: *const i64,
+    _key: *const u32,
+) -> i32 {
+    let fd = resolve_fd(handle);
+    if fd < 0 || buf.is_null() {
+        set_nt_status(io_status, 0xC000_0008u32 as i32); // STATUS_INVALID_HANDLE
+        return 0xC000_0008u32 as i32;
+    }
+    // SAFETY: the guest passes a buffer valid for `len` bytes (Windows contract).
+    let n = unsafe { libc::read(fd, buf as *mut c_void, len as usize) };
+    if n < 0 {
+        let status = errno_to_nt();
+        set_nt_status(io_status, status);
+        return status;
+    }
+    if n == 0 {
+        // EOF on a read of >0 requested bytes.
+        set_io_status(io_status, 0xC000_0011u32 as i32, 0); // STATUS_END_OF_FILE
+        return 0xC000_0011u32 as i32;
+    }
+    set_io_status(io_status, 0, n as usize); // STATUS_SUCCESS, bytes read
+    0 // STATUS_SUCCESS
+}
+
+/// Write just the `Status` field (offset 0) of an `IO_STATUS_BLOCK`.
+///
+/// SAFETY: `io_status` must be a valid guest pointer to a 16-byte `IO_STATUS_BLOCK`
+/// (or null, in which case this is a no-op).
+fn set_nt_status(io_status: *mut c_void, status: i32) {
+    if io_status.is_null() {
+        return;
+    }
+    // SAFETY: `IO_STATUS_BLOCK` starts with a union whose `Status` variant is an i32
+    // at offset 0; the caller guarantees the pointer is valid for 16 bytes.
+    unsafe { std::ptr::write_unaligned(io_status as *mut i32, status) };
+}
+
+/// Write both `Status` (offset 0) and `Information` (offset 8) of an `IO_STATUS_BLOCK`.
+///
+/// SAFETY: `io_status` must be a valid guest pointer to a 16-byte `IO_STATUS_BLOCK`
+/// (or null, in which case this is a no-op).
+fn set_io_status(io_status: *mut c_void, status: i32, information: usize) {
+    if io_status.is_null() {
+        return;
+    }
+    // SAFETY: `IO_STATUS_BLOCK` is `#[repr(C)]` with `Status` (i32) at offset 0 and
+    // `Information` (usize) at offset 8 on x64; the caller guarantees validity.
+    unsafe {
+        std::ptr::write_unaligned(io_status as *mut i32, status);
+        std::ptr::write_unaligned(io_status.add(8) as *mut usize, information);
+    }
+}
+
+/// Map the current thread's Linux errno to an NTSTATUS (best-effort).
+fn errno_to_nt() -> i32 {
+    // SAFETY: `__errno_location` returns a thread-local pointer safe to read.
+    let e = unsafe { *libc::__errno_location() };
+    match e {
+        libc::EBADF => 0xC000_0008u32 as i32,  // STATUS_INVALID_HANDLE
+        libc::EINVAL => 0xC000_000Du32 as i32, // STATUS_INVALID_PARAMETER
+        libc::ENOENT => 0xC000_0034u32 as i32, // STATUS_OBJECT_NAME_NOT_FOUND
+        libc::EACCES => 0xC000_0022u32 as i32, // STATUS_ACCESS_DENIED
+        libc::EEXIST => 0xC000_0035u32 as i32, // STATUS_OBJECT_NAME_COLLISION
+        libc::ENOSPC => 0xC000_0079u32 as i32, // STATUS_DISK_FULL
+        _ => 0xC000_0001u32 as i32,            // STATUS_UNSUCCESSFUL
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

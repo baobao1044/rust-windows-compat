@@ -155,7 +155,7 @@ impl ThunkArena {
         if n_args > 6 {
             return Err(ThunkError::TooManyArgs { n: n_args });
         }
-        let code = emit_noreturn(target);
+        let code = emit_noreturn(target, n_args);
         let off = self.alloc(code.len())?;
         unsafe {
             std::ptr::copy_nonoverlapping(code.as_ptr(), self.base.add(off), code.len());
@@ -354,20 +354,34 @@ fn emit_returning(target: *const c_void, n_args: u8) -> Vec<u8> {
 /// 6 integer arguments. It shuffles the registers (and loads stack args 5/6 into r8/r9 for
 /// the System V callee) and tail-calls (`jmp`) the implementation; the implementation never
 /// returns, so no frame or register preservation is needed.
-fn emit_noreturn(target: *const c_void) -> Vec<u8> {
+///
+/// The arg5/arg6 stack loads are only emitted when `n_args >= 5`/`>= 6`, matching
+/// `emit_returning`. Emitting them unconditionally reads past the Windows caller's
+/// shadow space into the 5th/6th argument slots, which may be unmapped when the caller
+/// didn't actually pass that many arguments (e.g. a 1-arg `ExitProcess` call whose
+/// `[rsp+0x30]` is above the guest stack top).
+fn emit_noreturn(target: *const c_void, n_args: u8) -> Vec<u8> {
     let mut v = Vec::with_capacity(48);
     v.extend_from_slice(&[0x48, 0x89, 0xCF]); // mov rdi, rcx   (arg1)
     v.extend_from_slice(&[0x48, 0x89, 0xD6]); // mov rsi, rdx   (arg2)
     v.extend_from_slice(&[0x4C, 0x89, 0xC2]); // mov rdx, r8    (arg3)
     v.extend_from_slice(&[0x4C, 0x89, 0xC9]); // mov rcx, r9    (arg4)
-                                              // For noreturn functions we always emit the arg5/arg6 loads (harmless if the callee
-                                              // takes fewer args; they just write r8/r9 which the callee ignores).
-                                              // mov r8, [rsp + 0x28]   (win arg5 -> sysv arg5)
-    v.extend_from_slice(&[0x4C, 0x8B, 0x84, 0x24]);
-    v.extend_from_slice(&0x28u32.to_le_bytes());
-    // mov r9, [rsp + 0x30]   (win arg6 -> sysv arg6)
-    v.extend_from_slice(&[0x4C, 0x8B, 0x8C, 0x24]);
-    v.extend_from_slice(&0x30u32.to_le_bytes());
+
+    // Windows args 5 and 6 live on the Windows stack but go into System V *registers* r8
+    // and r9. Only emit these loads when the callee actually takes that many args; reading
+    // [rsp+0x28]/[rsp+0x30] when the caller didn't provide them can touch unmapped memory
+    // above the guest stack top.
+    if n_args >= 5 {
+        // mov r8, [rsp + 0x28]   (win arg5 -> sysv arg5)
+        v.extend_from_slice(&[0x4C, 0x8B, 0x84, 0x24]);
+        v.extend_from_slice(&0x28u32.to_le_bytes());
+    }
+    if n_args >= 6 {
+        // mov r9, [rsp + 0x30]   (win arg6 -> sysv arg6)
+        v.extend_from_slice(&[0x4C, 0x8B, 0x8C, 0x24]);
+        v.extend_from_slice(&0x30u32.to_le_bytes());
+    }
+
     v.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
     v.extend_from_slice(&(target as u64).to_le_bytes());
     v.extend_from_slice(&[0xFF, 0xE0]); // jmp rax

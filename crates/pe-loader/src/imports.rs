@@ -38,6 +38,8 @@ pub struct ResolvedImports {
 /// `imports` is goblin's parsed import list. Returns the address to store in each IAT slot
 /// along with a record of what was resolved vs. stubbed.
 pub fn resolve(imports: &[goblin::pe::import::Import], known: &ImplTable) -> ResolvedImports {
+    let soft = soft_stubs_enabled();
+    let soft_ptr = known.soft_stub_ptr();
     let mut out = ResolvedImports::default();
     for imp in imports {
         let dll = imp.dll.to_lowercase();
@@ -46,16 +48,25 @@ pub fn resolve(imports: &[goblin::pe::import::Import], known: &ImplTable) -> Res
             out.resolved.insert((dll.clone(), sym.clone()), ptr);
         } else {
             log::warn!(
-                "stubbed import: {}!{} (no M1 implementation)",
+                "stubbed import: {}!{} (no implementation; {})",
                 imp.dll,
-                imp.name
+                imp.name,
+                if soft { "soft stub" } else { "hard trap" }
             );
             out.stubbed.push((dll.clone(), sym.clone()));
-            out.resolved
-                .insert((dll.clone(), sym.clone()), trap_stub as FnPtr);
+            let stub = if soft { soft_ptr } else { trap_stub as FnPtr };
+            out.resolved.insert((dll.clone(), sym.clone()), stub);
         }
     }
     out
+}
+
+/// Whether "soft stubs" are enabled: unknown imports get a no-op that logs once and returns 0
+/// instead of the hard trap that aborts. Toggled by `NIGG_SOFT_STUBS=1`. This lets a PE's
+/// CRT init survive calls to unimplemented imports (e.g. file/socket APIs a `println!`
+/// program never actually depends on) long enough to reach `main`.
+fn soft_stubs_enabled() -> bool {
+    std::env::var_os("NIGG_SOFT_STUBS").is_some_and(|v| v == "1" || v == "true")
 }
 
 /// `extern "C"` trap stub for unimplemented imports. Logs the call site symbol and aborts
@@ -65,6 +76,14 @@ extern "C" fn trap_stub() -> u32 {
     eprintln!("nigg-loader: called unimplemented Windows import — aborting");
     // STATUS_DLL_INIT_FAILED-ish sentinel (0xC000_0142 as a signed exit code).
     std::process::exit(0xC000_0142u32 as i32);
+}
+
+/// `extern "C"` soft stub for unimplemented imports. Returns 0 / FALSE so the caller can
+/// continue. Used when `NIGG_SOFT_STUBS=1` is set so the CRT init path survives calls to APIs
+/// a `println!` program imports but never truly needs.
+extern "C" fn soft_stub() -> u32 {
+    log::trace!("PE loader: soft-stubbed import called (returning 0)");
+    0
 }
 
 /// The native address of the trap stub, for distinguishing stubbed IAT entries from real
@@ -130,9 +149,19 @@ struct ImportSpec {
 /// trampoline pointers; for the unit tests they may be direct fn pointers.
 pub struct ImplTable {
     map: HashMap<(String, String), FnPtr>,
+    /// An ABI-correct trampoline for the soft stub (returns 0, preserves Windows
+    /// callee-saved registers). Used for unimplemented imports when `NIGG_SOFT_STUBS=1`.
+    soft_stub_thunk: FnPtr,
 }
 
 impl ImplTable {
+    /// The trampoline address for the soft stub. The trampoline preserves Windows
+    /// callee-saved registers (RDI/RSI) so the PE caller's state is intact after the stub
+    /// returns 0.
+    pub fn soft_stub_ptr(&self) -> FnPtr {
+        self.soft_stub_thunk
+    }
+
     /// Build the table of M1 implemented exports, wrapping each implementation in a
     /// Win64->SysV trampoline allocated from `arena`. The arena must be `finalize()`d
     /// (flipped to PROT_EXEC) before any IAT entry is called.
@@ -181,7 +210,23 @@ impl ImplTable {
             map.insert((spec.dll.to_string(), spec.sym.to_string()), ptr);
         }
 
-        ImplTable { map }
+        // Insert the msvcrt data symbols (e.g. `__initenv`, `_commode`, `_fmode`) as raw
+        // static addresses — no trampoline. The PE reads these IAT slots as data
+        // pointers (the address of the global), not callable function pointers.
+        for (dll, sym, ptr) in nigg_win32_kernel32::crt::data_exports() {
+            map.insert((dll.to_string(), sym.to_string()), ptr);
+        }
+
+        // Allocate an ABI-correct trampoline for the soft stub (0-arg, returns 0). It
+        // preserves the Windows callee-saved registers so the PE caller survives the call.
+        let soft_stub_thunk = arena
+            .make_thunk(soft_stub as FnPtr, 0)
+            .expect("soft stub thunk");
+
+        ImplTable {
+            map,
+            soft_stub_thunk,
+        }
     }
 
     /// Build the table with **direct** fn pointers (no trampolines), for unit tests that
@@ -193,10 +238,17 @@ impl ImplTable {
         for spec in specs {
             map.insert((spec.dll.to_string(), spec.sym.to_string()), spec.target);
         }
+        // Insert the msvcrt data symbols as raw addresses (test path mirrors `build`).
+        for (dll, sym, ptr) in nigg_win32_kernel32::crt::data_exports() {
+            map.insert((dll.to_string(), sym.to_string()), ptr);
+        }
         // Forward to apiset pseudo-DLLs (using the same direct pointers).
         let mut forward_map = map.clone();
         forward_apisets_direct(&mut forward_map, &map);
-        ImplTable { map: forward_map }
+        ImplTable {
+            map: forward_map,
+            soft_stub_thunk: soft_stub as FnPtr,
+        }
     }
 
     fn lookup(&self, dll: &str, sym: &str) -> Option<FnPtr> {
@@ -567,6 +619,20 @@ fn import_specs() -> Vec<ImportSpec> {
             n_args: 1,
             noreturn: false,
         },
+        ImportSpec {
+            dll: "ntdll.dll",
+            sym: "NtWriteFile",
+            target: nt::process::nt_write_file as FnPtr,
+            n_args: 9,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "ntdll.dll",
+            sym: "NtReadFile",
+            target: nt::process::nt_read_file as FnPtr,
+            n_args: 9,
+            noreturn: false,
+        },
         // --- vcruntime / ucrt intrinsics ---
         ImportSpec {
             dll: "vcruntime140.dll",
@@ -674,6 +740,71 @@ fn import_specs() -> Vec<ImportSpec> {
                 n_args: e.n_args,
                 noreturn: e.noreturn,
             });
+        }
+    }
+
+    // Wire in the msvcrt (CRT) function exports from `nigg-win32-kernel32::crt`. These are
+    // the C runtime functions (malloc, free, strlen, fprintf, __getmainargs, exit, ...)
+    // the mingw-w64 CRT startup sequence calls. Dedup so a symbol already registered (e.g.
+    // memset/memcpy/memmove above) keeps its canonical thunk.
+    for e in nigg_win32_kernel32::crt::crt_export_specs() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the extra kernel32/ntdll/bcryptprimitives/userenv exports from
+    // `nigg-win32-kernel32::extras` (exception handling stubs, system info, file/path
+    // helpers, ProcessPrng, GetUserProfileDirectoryW, RtlNtStatusToDosError, etc.).
+    for e in nigg_win32_kernel32::extras::extra_export_specs() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the api-ms-win-core-synch WaitOnAddress family (futex-backed, in ntapi).
+    // These live under the `api-ms-win-core-synch-l1-2-0.dll` pseudo-DLL.
+    let wait_specs = [
+        ImportSpec {
+            dll: "api-ms-win-core-synch-l1-2-0.dll",
+            sym: "WaitOnAddress",
+            target: nt::sync::wait_on_address as FnPtr,
+            n_args: 4,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "api-ms-win-core-synch-l1-2-0.dll",
+            sym: "WakeByAddressAll",
+            target: nt::sync::wake_by_address_all as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "api-ms-win-core-synch-l1-2-0.dll",
+            sym: "WakeByAddressSingle",
+            target: nt::sync::wake_by_address_single as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+    ];
+    for s in wait_specs {
+        let key = (s.dll.to_string(), s.sym.to_string());
+        if seen.insert(key) {
+            specs.push(s);
         }
     }
 
@@ -813,6 +944,54 @@ const FORWARD_SYMBOLS: &[&str] = &[
     "lstrlenA",
     "lstrcpyW",
     "lstrcatW",
+    // --- M6c: extra kernel32 (system info, exception, file, process) ---
+    "AddVectoredExceptionHandler",
+    "SetUnhandledExceptionFilter",
+    "SetConsoleCtrlHandler",
+    "RaiseException",
+    "__C_specific_handler",
+    "RtlCaptureContext",
+    "RtlLookupFunctionEntry",
+    "RtlVirtualUnwind",
+    "RtlUnwindEx",
+    "GetSystemTimePreciseAsFileTime",
+    "GetSystemInfo",
+    "GetConsoleOutputCP",
+    "GetModuleFileNameW",
+    "GetCurrentDirectoryW",
+    "GetSystemDirectoryW",
+    "GetWindowsDirectoryW",
+    "GetTempPathW",
+    "GetFullPathNameW",
+    "GetFileAttributesW",
+    "GetFileType",
+    "GetFileSizeEx",
+    "SetFilePointerEx",
+    "SetHandleInformation",
+    "SetThreadStackGuarantee",
+    "SwitchToThread",
+    "GetProcAddress",
+    "InitOnceBeginInitialize",
+    "InitOnceComplete",
+    "CompareStringOrdinal",
+    "FormatMessageW",
+    "MapViewOfFile",
+    "UnmapViewOfFile",
+    "CreateFileMappingA",
+    "GetOverlappedResult",
+    "ReadConsoleW",
+    "WriteFileEx",
+    "ReadFileEx",
+    "FlushFileBuffers",
+    "SetFileAttributesW",
+    "TerminateProcess",
+    "GetProcessId",
+    "GetExitCodeProcess",
+    "WaitForSingleObjectEx",
+    // --- api-ms-win-core-synch-l1-2-0 (WaitOnAddress family) ---
+    "WaitOnAddress",
+    "WakeByAddressAll",
+    "WakeByAddressSingle",
 ];
 
 /// Forward `FORWARD_SYMBOLS` from kernel32 to each apiset, allocating shared thunks (one
