@@ -14,6 +14,7 @@ members = [
     "crates/d3d11",
     "crates/d3d11-com",
     "crates/d3d12",
+    "crates/d3d12-com",
     "crates/hlsl-compiler",
     "crates/tests",
     "tests/fixtures",

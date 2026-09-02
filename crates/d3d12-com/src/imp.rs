@@ -60,11 +60,9 @@ unsafe extern "C" fn d3d12_create_device(
 }
 
 /// The D3D12 import-level exports the PE loader registers.
-pub(crate) static EXPORT_SPECS: &[ComExportSpec] = &[
-    ComExportSpec {
-        dll: "d3d12.dll",
-        sym: "D3D12CreateDevice",
-        target: d3d12_create_device as *const c_void,
-        n_args: 4,
-    },
-];
+pub(crate) static EXPORT_SPECS: &[ComExportSpec] = &[ComExportSpec {
+    dll: "d3d12.dll",
+    sym: "D3D12CreateDevice",
+    target: d3d12_create_device as *const c_void,
+    n_args: 4,
+}];

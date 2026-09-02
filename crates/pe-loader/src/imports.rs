@@ -166,10 +166,11 @@ impl ImplTable {
     /// Win64->SysV trampoline allocated from `arena`. The arena must be `finalize()`d
     /// (flipped to PROT_EXEC) before any IAT entry is called.
     ///
-    /// This also installs the M7a D3D11/DXGI COM vtables: a Win64->SysV thunk is
-    /// allocated (from the same `arena`) for every vtable slot, and the
-    /// import-level D3D11/DXGI exports (`D3D11CreateDeviceAndSwapChain`,
-    /// `CreateDXGIFactory`, ...) are registered as thunks too. Both must happen
+    /// This also installs the M7a D3D11/DXGI COM vtables and the M8b D3D12 COM
+    /// vtables: a Win64->SysV thunk is allocated (from the same `arena`) for
+    /// every vtable slot, and the import-level D3D11/DXGI/D3D12 exports
+    /// (`D3D11CreateDeviceAndSwapChain`, `CreateDXGIFactory`,
+    /// `D3D12CreateDevice`, ...) are registered as thunks too. Both must happen
     /// before `arena.finalize()` (the caller seals the arena after this returns).
     pub fn build(arena: &mut ThunkArena) -> Self {
         let specs = import_specs();
@@ -204,6 +205,25 @@ impl ImplTable {
         // links against; calling them creates the COM objects and hands their
         // interface pointers back to the PE.
         for spec in nigg_d3d11_com::com_export_specs() {
+            let ptr = arena
+                .make_thunk(spec.target, spec.n_args)
+                .unwrap_or_else(|e| panic!("thunk for {}!{} failed: {e}", spec.dll, spec.sym));
+            map.insert((spec.dll.to_string(), spec.sym.to_string()), ptr);
+        }
+
+        // --- M8b: install the D3D12 COM vtables ---
+        // Same mechanism as the D3D11/DXGI vtables above: allocate a Win64->SysV
+        // thunk for every D3D12 vtable slot (leaked inside `install_vtables` so
+        // the addresses stay valid for the PE's lifetime), then register the
+        // import-level D3D12 exports (`D3D12CreateDevice`, ...) as thunks too.
+        // Both must happen before `arena.finalize()` (the caller seals the arena
+        // after this returns).
+        nigg_d3d12_com::install_vtables(&mut |target, n_args| {
+            arena
+                .make_thunk(target, n_args)
+                .unwrap_or_else(|e| panic!("COM vtable thunk failed: {e}"))
+        });
+        for spec in nigg_d3d12_com::com_export_specs() {
             let ptr = arena
                 .make_thunk(spec.target, spec.n_args)
                 .unwrap_or_else(|e| panic!("thunk for {}!{} failed: {e}", spec.dll, spec.sym));

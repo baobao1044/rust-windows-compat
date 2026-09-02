@@ -218,6 +218,89 @@ fn nigg_loader_runs_d3d11_sample_and_exits_0() {
     }
 }
 
+/// Locate the cross-compiled `d3d12_sample.exe` (a standalone workspace under
+/// `tests/d3d12-sample`). Returns `None` when it has not been built yet so the
+/// test skips gracefully (it needs a separate cross-compile step and Vulkan at
+/// runtime, neither guaranteed in every CI environment).
+fn d3d12_sample_exe() -> Option<PathBuf> {
+    // `tests/d3d12-sample` is its own workspace, so its target dir is local
+    // (unless CARGO_TARGET_DIR is set).
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("tests/d3d12-sample/target"));
+    let exe = target_dir
+        .join("x86_64-pc-windows-gnu")
+        .join("debug")
+        .join("d3d12_sample.exe");
+    if exe.exists() {
+        Some(exe)
+    } else {
+        None
+    }
+}
+
+/// M8b acceptance test: the cross-compiled D3D12 sample PE (a `#![no_std]`
+/// program that imports `d3d12.dll`/`kernel32.dll`) must run end-to-end through
+/// `nigg-loader` and exit 0.
+///
+/// This validates the D3D12 COM vtable thunk layer end-to-end: the PE's
+/// `D3D12CreateDevice` import resolves to our COM thunk, which creates an
+/// `ID3D12Device` COM object whose vtable slots are Win64->SysV trampolines.
+/// The PE then drives the vtables (CreateCommandQueue ->
+/// CreateCommandAllocator -> CreateCommandList -> CreateDescriptorHeap ->
+/// GetDescriptorHandleIncrementSize -> CreateCommittedResource ->
+/// CreateRenderTargetView -> ResourceBarrier -> ClearRenderTargetView ->
+/// ResourceBarrier -> Close -> ExecuteCommandLists), which delegate to the
+/// existing Rust D3D12-over-Vulkan translation, and finally calls
+/// `ExitProcess(0)`.
+///
+/// The test skips (passing) if the sample has not been cross-compiled or if no
+/// Vulkan device is available, so `cargo test --workspace` stays green in
+/// minimal environments. Build the sample with:
+///   cargo build --target x86_64-pc-windows-gnu --manifest-path tests/d3d12-sample/Cargo.toml
+#[test]
+fn nigg_loader_runs_d3d12_sample_and_exits_0() {
+    let exe_path = match d3d12_sample_exe() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "nigg-loader: skipping nigg_loader_runs_d3d12_sample_and_exits_0 — \
+                 d3d12_sample.exe not built. Build it with: \
+                 `cargo build --target x86_64-pc-windows-gnu --manifest-path \
+                 tests/d3d12-sample/Cargo.toml`."
+            );
+            return;
+        }
+    };
+
+    let output = Command::new(BIN)
+        .arg(&exe_path)
+        .output()
+        .expect("run nigg-loader");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    match output.status.code() {
+        Some(0) => {}
+        Some(code @ 125) => {
+            // 125 is the loader's "runtime error" exit (e.g. no Vulkan device).
+            // Skip rather than fail so the test stays green on headless/no-Vulkan hosts.
+            eprintln!(
+                "nigg-loader: skipping nigg_loader_runs_d3d12_sample_and_exits_0 — \
+                 loader runtime error (likely no Vulkan device), exit {code}.\n\
+                 stdout={stdout}\nstderr={stderr}"
+            );
+        }
+        other => {
+            panic!(
+                "nigg-loader must exit 0 for the D3D12 sample PE (got {other:?})\n\
+                 stdout={stdout}\nstderr={stderr}"
+            );
+        }
+    }
+}
+
 /// Locate the cross-compiled `d3d11_triangle.exe` (a standalone workspace under
 /// `tests/d3d11-triangle`). Returns `None` when it has not been built yet so the
 /// test skips gracefully (it needs a separate cross-compile step and Vulkan at

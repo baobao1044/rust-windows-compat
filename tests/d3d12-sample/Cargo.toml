@@ -1,0 +1,26 @@
+[package]
+name = "nigg-d3d12-sample"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# M8b D3D12 sample PE. A #![no_std]/#![no_main] Windows program that imports
+# only d3d12.dll/kernel32.dll (via raw-dylib + custom entry, no CRT), exercises
+# the D3D12 COM vtable thunk layer: D3D12CreateDevice → CreateCommandQueue →
+# CreateCommandAllocator → CreateCommandList → CreateDescriptorHeap →
+# CreateCommittedResource → CreateRenderTargetView → ResourceBarrier →
+# ClearRenderTargetView → Close → ExecuteCommandLists → ExitProcess(0).
+# Standalone workspace so its own profiles apply.
+
+[[bin]]
+name = "d3d12_sample"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]

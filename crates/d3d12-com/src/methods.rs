@@ -316,8 +316,10 @@ extern "C" fn device_create_command_queue(
     match dev.device.create_command_queue(map_list_type(list_type)) {
         Ok(queue) => {
             // SAFETY: freshly built COM object with the pre-allocated vtable.
-            let ptr =
-                crate::ComObject::into_raw(vtables().command_queue as *const c_void, CommandQueueInner { queue });
+            let ptr = crate::ComObject::into_raw(
+                vtables().command_queue as *const c_void,
+                CommandQueueInner { queue },
+            );
             // SAFETY: `pp` is a valid out-pointer per the contract.
             unsafe { *pp = ptr };
             S_OK
@@ -343,7 +345,10 @@ extern "C" fn device_create_command_allocator(
     }
     // SAFETY: `this` is a live device COM object allocated by `into_raw`.
     let dev = unsafe { inner::<DeviceInner>(this) };
-    match dev.device.create_command_allocator(map_list_type(list_type)) {
+    match dev
+        .device
+        .create_command_allocator(map_list_type(list_type))
+    {
         Ok(allocator) => {
             // SAFETY: freshly built COM object with the pre-allocated vtable.
             let ptr = crate::ComObject::into_raw(
@@ -385,11 +390,16 @@ extern "C" fn device_create_command_list(
     let allocator = unsafe { inner::<AllocatorInner>(p_allocator).allocator.clone() };
     // SAFETY: `this` is a live device COM object allocated by `into_raw`.
     let dev = unsafe { inner::<DeviceInner>(this) };
-    match dev.device.create_command_list(allocator, map_list_type(list_type)) {
+    match dev
+        .device
+        .create_command_list(allocator, map_list_type(list_type))
+    {
         Ok(list) => {
             // SAFETY: freshly built COM object with the pre-allocated vtable.
-            let ptr =
-                crate::ComObject::into_raw(vtables().command_list as *const c_void, CommandListInner { list });
+            let ptr = crate::ComObject::into_raw(
+                vtables().command_list as *const c_void,
+                CommandListInner { list },
+            );
             // SAFETY: `pp` is a valid out-pointer per the contract.
             unsafe { *pp = ptr };
             S_OK
@@ -416,7 +426,10 @@ extern "C" fn device_create_descriptor_heap(
     let (heap_type, count) = unsafe { ((*p_desc).heap_type, (*p_desc).num_descriptors) };
     // SAFETY: `this` is a live device COM object allocated by `into_raw`.
     let dev = unsafe { inner::<DeviceInner>(this) };
-    match dev.device.create_descriptor_heap(map_heap_type(heap_type), count) {
+    match dev
+        .device
+        .create_descriptor_heap(map_heap_type(heap_type), count)
+    {
         Ok(heap) => {
             // SAFETY: freshly built COM object with the pre-allocated vtable.
             let ptr = crate::ComObject::into_raw(
@@ -502,8 +515,10 @@ extern "C" fn device_create_committed_resource(
     {
         Ok(resource) => {
             // SAFETY: freshly built COM object with the pre-allocated vtable.
-            let ptr =
-                crate::ComObject::into_raw(vtables().resource as *const c_void, ResourceInner { resource });
+            let ptr = crate::ComObject::into_raw(
+                vtables().resource as *const c_void,
+                ResourceInner { resource },
+            );
             // SAFETY: `pp` is a valid out-pointer per the contract.
             unsafe { *pp = ptr };
             S_OK
@@ -621,7 +636,10 @@ extern "C" fn cmdlist_set_render_targets(
         let list = inner_mut::<CommandListInner>(this);
         let heap = inner::<DescriptorHeapInner>(first as *mut c_void);
         let handle = nigg_d3d12::CpuDescriptorHandle { index: 0 };
-        if let Err(e) = list.list.set_render_targets(&heap.heap, std::slice::from_ref(&handle)) {
+        if let Err(e) = list
+            .list
+            .set_render_targets(&heap.heap, std::slice::from_ref(&handle))
+        {
             log::warn!("d3d12-com: OMSetRenderTargets failed: {e}");
         }
     }
@@ -692,10 +710,7 @@ extern "C" fn cmdlist_resource_barrier(
                 state_before: map_state(b.state_before),
                 state_after: map_state(b.state_after),
             };
-            if let Err(e) = list
-                .list
-                .resource_barrier(std::slice::from_ref(&barrier))
-            {
+            if let Err(e) = list.list.resource_barrier(std::slice::from_ref(&barrier)) {
                 log::warn!("d3d12-com: ResourceBarrier[{i}] failed: {e}");
             }
         }
@@ -715,9 +730,9 @@ extern "C" fn cmdlist_draw_instanced(
 ) {
     // SAFETY: `this` is a live command-list COM object allocated by `into_raw`.
     let list = unsafe { inner_mut::<CommandListInner>(this) };
-    if let Err(e) = list
-        .list
-        .draw_instanced(vertex_count, instance_count, start_vertex, start_instance)
+    if let Err(e) =
+        list.list
+            .draw_instanced(vertex_count, instance_count, start_vertex, start_instance)
     {
         log::warn!("d3d12-com: DrawInstanced failed: {e}");
     }
@@ -773,8 +788,10 @@ impl ComVtables {
             create_descriptor_heap: mk(device_create_descriptor_heap as *const c_void, 4),
             create_render_target_view: mk(device_create_render_target_view as *const c_void, 4),
             create_committed_resource: mk(device_create_committed_resource as *const c_void, 8),
-            get_descriptor_handle_increment_size:
-                mk(device_get_descriptor_handle_increment_size as *const c_void, 2),
+            get_descriptor_handle_increment_size: mk(
+                device_get_descriptor_handle_increment_size as *const c_void,
+                2,
+            ),
         })) as *const Id3d12DeviceVtbl;
 
         let command_queue = Box::into_raw(Box::new(Id3d12CommandQueueVtbl {

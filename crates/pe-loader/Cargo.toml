@@ -19,6 +19,7 @@ nigg-win32-kernel32 = { path = "../win32-kernel32" }
 nigg-win32-user32 = { path = "../win32-user32" }
 nigg-win32-gdi32 = { path = "../win32-gdi32" }
 nigg-d3d11-com = { path = "../d3d11-com" }
+nigg-d3d12-com = { path = "../d3d12-com" }
 
 [dev-dependencies]
 nigg-tests-fixtures = { path = "../../tests/fixtures" }
