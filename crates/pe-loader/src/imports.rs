@@ -850,6 +850,22 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
+    // Wire in the Winsock2 (ws2_32.dll) exports — the Windows Sockets API that
+    // networked apps and userland anti-cheat DLLs (EAC, BattlEye) use for
+    // telemetry communication. Each function delegates to the POSIX socket API.
+    for e in nigg_win32_ws2_32::ws2_32_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
     // Wire in the api-ms-win-core-synch WaitOnAddress family (futex-backed, in ntapi).
     // These live under the `api-ms-win-core-synch-l1-2-0.dll` pseudo-DLL.
     let wait_specs = [

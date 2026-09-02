@@ -1,0 +1,9 @@
+[package]
+name = "nigg-win32-ws2_32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+log.workspace = true
