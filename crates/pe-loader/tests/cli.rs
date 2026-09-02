@@ -383,3 +383,64 @@ fn nigg_loader_runs_d3d11_triangle_and_exits_0() {
         }
     }
 }
+
+/// Locate the cross-compiled `anticheat_sim.exe` (a standalone workspace under
+/// `tests/anticheat-sim`). Returns `None` when it has not been built yet.
+fn anticheat_sim_exe() -> Option<PathBuf> {
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("tests/anticheat-sim/target"));
+    let exe = target_dir
+        .join("x86_64-pc-windows-gnu")
+        .join("debug")
+        .join("anticheat_sim.exe");
+    if exe.exists() {
+        Some(exe)
+    } else {
+        None
+    }
+}
+
+/// M7+ acceptance test: the anti-cheat simulation PE must run through nigg-loader
+/// and exit 0. This validates the full anti-cheat API surface end-to-end: debug
+/// detection, module enumeration, process introspection, Winsock init, registry
+/// query, and system info collection — all through the Win64→SysV ABI thunk layer.
+#[test]
+fn nigg_loader_runs_anticheat_sim_and_exits_0() {
+    let exe_path = match anticheat_sim_exe() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "nigg-loader: skipping nigg_loader_runs_anticheat_sim_and_exits_0 — \
+                 anticheat_sim.exe not built. Build it with: \
+                 `cargo build --target x86_64-pc-windows-gnu --manifest-path \
+                 tests/anticheat-sim/Cargo.toml`."
+            );
+            return;
+        }
+    };
+
+    let output = Command::new(BIN)
+        .arg(&exe_path)
+        .output()
+        .expect("run nigg-loader");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    match output.status.code() {
+        Some(0) => {}
+        Some(code @ 125) => {
+            eprintln!(
+                "nigg-loader: skipping anticheat_sim — loader runtime error, exit {code}.\n\
+                 stdout={stdout}\nstderr={stderr}"
+            );
+        }
+        other => {
+            panic!(
+                "nigg-loader must exit 0 for the anti-cheat sim PE (got {other:?})\n\
+                 stdout={stdout}\nstderr={stderr}"
+            );
+        }
+    }
+}

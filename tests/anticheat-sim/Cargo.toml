@@ -1,0 +1,27 @@
+[package]
+name = "nigg-anticheat-sim"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# A PE that simulates the anti-cheat initialization sequence:
+# 1. Check for debugger (IsDebuggerPresent, CheckRemoteDebuggerPresent)
+# 2. Enumerate loaded modules (CreateToolhelp32Snapshot, Module32First/Next)
+# 3. Read own process memory (OpenProcess + ReadProcessMemory)
+# 4. Initialize Winsock (WSAStartup) and attempt a connection
+# 5. Query registry (RegOpenKeyW + RegQueryValueExW)
+# 6. Get system info (GetUserNameW, GetComputerNameW)
+# 7. Exit cleanly
+
+[[bin]]
+name = "anticheat_sim"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]
