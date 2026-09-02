@@ -4,4 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Test harness for the Nigg compatibility layer. Locates fixture Windows EXEs (built
+# under tests/fixtures for the windows-gnu target), validates them as PE32+, and (once
+# WS-A lands) drives `nigg-loader` against them end-to-end.
+
 [dependencies]
+goblin.workspace = true
+
+[lib]
+name = "nigg_tests"

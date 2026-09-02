@@ -4,6 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Tiny Windows console EXEs cross-compiled for x86_64-pc-windows-gnu. They are the
+# fixtures driven by the `nigg-tests` harness (crates/tests). Build them with:
+#   cargo build --target x86_64-pc-windows-gnu -p nigg-tests-fixtures
+
+[lib]
+name = "nigg_tests_fixtures"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hello"
 path = "src/hello.rs"
+
+[[bin]]
+name = "exit_code"
+path = "src/exit_code.rs"
+
+[[bin]]
+name = "args"
+path = "src/args.rs"
+
+[dev-dependencies]
+goblin.workspace = true

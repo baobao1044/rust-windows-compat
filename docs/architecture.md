@@ -79,3 +79,11 @@ are compiled to SPIR-V by the `hlsl-compiler` crate and fed to Vulkan pipelines.
 | WS-G | tests, CI, docs | — (parallel from day 1) |
 
 Four workstreams (A, D, F, G) run in parallel from day one.
+
+## Build & test
+
+See [development.md](development.md) for the full guide: prerequisites, how to build and
+test the workspace, how to cross-compile the test fixtures for `x86_64-pc-windows-gnu`,
+and how to run `nigg-loader` / `nigg-hlslc`. The milestone ladder lives in the top-level
+[README](../README.md#milestone-ladder); the honest compatibility matrix lives in
+[compatibility.md](compatibility.md).

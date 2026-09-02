@@ -31,3 +31,7 @@ this project's test harness. Empty cells mean not-yet-reached.
 - 🚧 in progress
 - ❌ not supported (with reason)
 - — not yet reached
+
+"Verified end-to-end" means a fixture or sample was driven through `nigg-loader` in the
+`nigg-tests` harness with the asserted behavior observed. See
+[development.md](development.md) for how to build the fixtures and run the harness.
