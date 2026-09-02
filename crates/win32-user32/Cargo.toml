@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nigg-wsi.workspace = true
+nigg-ntapi.workspace = true
+log.workspace = true
+parking_lot.workspace = true

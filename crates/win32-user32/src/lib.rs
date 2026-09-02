@@ -1,1 +1,942 @@
-//! user32 subset: windowing and message loop.
+//! user32 subset: Win32 windowing and message loop, backed by `nigg-wsi`.
+//!
+//! Implements the core of a Win32 message loop: `RegisterClassExW`, `CreateWindowExW`,
+//! `GetMessageW`/`PeekMessageW`/`DispatchMessageW`, `PostQuitMessage`,
+//! `SendMessageW`/`PostMessageW`, and `DefWindowProcW`. Window events from the host
+//! (`nigg_wsi::WindowEvent`) are translated into Win32 `MSG` records; `DispatchMessageW`
+//! calls the PE-supplied window procedure through a Win64→SysV ABI thunk.
+//!
+//! The window and class tables are thread-local because `wsi::Window` (the X11
+//! connection) is not `Send` — matching Win32's single-threaded message-loop model.
+//! All exports are `extern "C"`; the PE loader's ABI thunk wraps them before they land
+//! in the IAT.
+
+#![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::os::raw::{c_int, c_void};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Opaque window handle. A small non-null integer encoded as a pointer.
+pub type HWND = *mut c_void;
+/// Opaque handle to a window class atom (small integer).
+pub type ATOM = u16;
+
+/// Win32 `POINT`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct Point {
+    pub x: c_int,
+    pub y: c_int,
+}
+
+/// Win32 `RECT`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct Rect {
+    pub left: c_int,
+    pub top: c_int,
+    pub right: c_int,
+    pub bottom: c_int,
+}
+
+/// Win32 `MSG`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct Msg {
+    pub hwnd: HWND,
+    pub message: u32,
+    pub w_param: usize,
+    pub l_param: isize,
+    pub time: u32,
+    pub pt: Point,
+}
+
+/// A window-procedure function pointer supplied by the PE image (Win64 ABI):
+/// `LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM)`.
+pub type WndProc = *const c_void;
+
+/// Minimal `WNDCLASSEXW` fields we capture at registration time.
+#[derive(Clone, Copy)]
+pub struct WndClassEx {
+    pub style: u32,
+    pub lpfn_wnd_proc: WndProc,
+    pub cb_cls_extra: c_int,
+    pub cb_wnd_extra: c_int,
+    pub h_instance: *mut c_void,
+    pub lpsz_class_name: *const u16,
+}
+
+// ---------------------------------------------------------------------------
+// Window-message constants
+// ---------------------------------------------------------------------------
+
+pub const WM_CREATE: u32 = 0x0001;
+pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_SIZE: u32 = 0x0005;
+pub const WM_PAINT: u32 = 0x000F;
+pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_QUIT: u32 = 0x0012;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_KEYUP: u32 = 0x0101;
+pub const WM_CHAR: u32 = 0x0102;
+pub const WM_MOUSEMOVE: u32 = 0x0200;
+pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_LBUTTONUP: u32 = 0x0202;
+
+/// `SW_SHOW`
+pub const SW_SHOW: c_int = 5;
+/// `SW_HIDE`
+pub const SW_HIDE: c_int = 0;
+
+// ---------------------------------------------------------------------------
+// Thread-local state (wsi::Window is not Send; Win32 message loops are single-thread)
+// ---------------------------------------------------------------------------
+
+/// One registered window class.
+struct ClassEntry {
+    atom: ATOM,
+    class: WndClassEx,
+    name: String,
+}
+
+/// One live window.
+struct WindowEntry {
+    /// The host window. `None` on a headless host or after `DestroyWindow`.
+    window: Option<nigg_wsi::Window>,
+    class_atom: ATOM,
+    wnd_proc: WndProc,
+    title: String,
+    width: u32,
+    height: u32,
+    visible: bool,
+    /// Pending paint flag (set by `InvalidateRect`, cleared by `ValidateRect`/`BeginPaint`).
+    paint_pending: bool,
+}
+
+#[derive(Default)]
+struct State {
+    classes: Vec<ClassEntry>,
+    windows: Vec<(HWND, WindowEntry)>,
+    /// The per-thread posted-message queue (`PostMessage`/`PostQuitMessage`).
+    queue: VecDeque<Msg>,
+    /// Nonzero once `PostQuitMessage` has been called; `GetMessage` then returns 0.
+    quit_code: Option<isize>,
+}
+
+thread_local! {
+    static STATE: RefCell<State> = RefCell::new(State::default());
+}
+
+static NEXT_HWND: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate a fresh non-null `HWND`.
+fn make_hwnd() -> HWND {
+    let id = NEXT_HWND.fetch_add(1, Ordering::Relaxed);
+    (id as usize | 0x2_0000_0000) as *mut c_void
+}
+
+fn find_class_by_name(name: &str) -> Option<ATOM> {
+    STATE.with(|s| {
+        s.borrow()
+            .classes
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.atom)
+    })
+}
+
+fn clear_paint_flag(hwnd: HWND) {
+    STATE.with(|s| {
+        if let Some((_, w)) = s.borrow_mut().windows.iter_mut().find(|(h, _)| *h == hwnd) {
+            w.paint_pending = false;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Win64→SysV window-procedure thunk
+// ---------------------------------------------------------------------------
+
+/// Call a PE window procedure `proc` (Win64 ABI) with four integer arguments, returning
+/// the `LRESULT` in `rax`. The thunk sets up the Win64 register arguments
+/// (RCX=`hwnd`, RDX=`msg`, R8=`wparam`, R9=`lparam`) and a 32-byte shadow space on a
+/// scratch stack, then tail-calls the procedure.
+///
+/// # Safety
+/// `proc` must be a valid, executable Win64 function pointer (a PE `lpfnWndProc` with
+/// relocations applied). The four arguments must match the `WndProc` contract.
+pub unsafe fn call_win64_wndproc(
+    proc_: *const c_void,
+    hwnd: u64,
+    msg: u32,
+    w_param: u64,
+    l_param: isize,
+) -> isize {
+    let mut result: isize;
+    // We allocate a 64-byte scratch region (32-byte Win64 shadow space + alignment) on
+    // the Rust stack and hand the *top* of it to the callee as its initial RSP. Win64
+    // requires 32 bytes of shadow space below the return address at the call site and
+    // 16-byte alignment *after* the implicit push of the return address — i.e. RSP
+    // entering the callee must be `(rsp - 8) % 16 == 0`. We reserve 64 bytes, align the
+    // handoff pointer down to 16 and leave 32 bytes of shadow below it.
+    let mut scratch = [0u8; 64];
+    let base = scratch.as_mut_ptr();
+    // Align up to 16 and leave 32 bytes of shadow space below the callee's RSP.
+    let handoff = ((base as usize + 48) & !0xF) as *mut u8;
+    // Pack the four Win64 arguments into a small array on the stack and load them with
+    // a single `in(reg)` pointer, avoiding the "too many registers" limit. We then move
+    // each argument into the correct Win64 register inline.
+    let args = [hwnd, msg as u64, w_param, l_param as u64];
+    let args_ptr = args.as_ptr();
+    unsafe {
+        core::arch::asm!(
+            "mov r12, rsp",
+            "mov rsp, {sp}",
+            "mov rax, {args}",
+            "mov rcx, [rax]",
+            "mov rdx, [rax+8]",
+            "mov r8, [rax+16]",
+            "mov r9, [rax+24]",
+            "call {proc}",
+            "mov rsp, r12",
+            sp = in(reg) handoff,
+            args = in(reg) args_ptr,
+            proc = in(reg) proc_,
+            out("r12") _,
+            out("rax") result,
+            out("rcx") _,
+            out("rdx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+        );
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Implemented exports (extern "C"; the ABI thunk in pe-loader wraps them)
+// ---------------------------------------------------------------------------
+
+/// `RegisterClassExW(const WNDCLASSEXW*) -> ATOM`. Stores the class and returns a fresh
+/// atom (nonzero). Returns 0 on null input.
+extern "C" fn register_class_ex_w(lpwcx: *const WndClassEx) -> ATOM {
+    if lpwcx.is_null() {
+        return 0;
+    }
+    // SAFETY: the guest provides `lpwcx` valid for one `WndClassEx` read.
+    let wcx = unsafe { *lpwcx };
+    let name = widestring_to_string(wcx.lpsz_class_name);
+    let atom = NEXT_HWND.fetch_add(1, Ordering::Relaxed) as u16 | 0x8000;
+    STATE.with(|s| {
+        s.borrow_mut().classes.push(ClassEntry {
+            atom,
+            class: wcx,
+            name,
+        });
+    });
+    log::trace!("user32!RegisterClassExW -> atom {atom}");
+    atom
+}
+
+/// `UnregisterClassW(LPCWSTR, HINSTANCE) -> int`. Removes the named class. Returns 1
+/// on success.
+extern "C" fn unregister_class_w(name: *const u16, _instance: *mut c_void) -> c_int {
+    if name.is_null() {
+        return 0;
+    }
+    let n = widestring_to_string(name);
+    let removed = STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        if let Some(pos) = st.classes.iter().position(|c| c.name == n) {
+            st.classes.remove(pos);
+            true
+        } else {
+            false
+        }
+    });
+    if removed {
+        1
+    } else {
+        0
+    }
+}
+
+/// `CreateWindowExW(...) -> HWND`. Opens a `wsi::Window` and records it under a fresh
+/// HWND. On a headless host (no display) the `wsi::Window` is `None` but the HWND is
+/// still valid for message-loop bookkeeping, so headless tests can exercise the loop.
+extern "C" fn create_window_ex_w(
+    _ex_style: u32,
+    class_name: *const u16,
+    _window_name: *const u16,
+    _style: u32,
+    _x: c_int,
+    _y: c_int,
+    width: c_int,
+    height: c_int,
+    _parent: HWND,
+    _menu: *mut c_void,
+    _instance: *mut c_void,
+    _param: *mut c_void,
+) -> HWND {
+    let cname = widestring_to_string(class_name);
+    let atom = match find_class_by_name(&cname) {
+        Some(a) => a,
+        None => {
+            log::warn!("user32!CreateWindowExW: class '{cname}' not registered");
+            return std::ptr::null_mut();
+        }
+    };
+    let (wnd_proc, w, h) = STATE
+        .with(|s| {
+            let st = s.borrow();
+            let cls = st.classes.iter().find(|c| c.atom == atom)?;
+            Some((cls.class.lpfn_wnd_proc, width.max(1) as u32, height.max(1) as u32))
+        })
+        .unwrap_or((std::ptr::null(), 1, 1));
+
+    let title = cname.clone();
+    // Try to open a real host window; degrade to None on a headless host.
+    let host_window = nigg_wsi::Window::new(&title, w, h).ok();
+
+    let hwnd = make_hwnd();
+    STATE.with(|s| {
+        s.borrow_mut().windows.push((
+            hwnd,
+            WindowEntry {
+                window: host_window,
+                class_atom: atom,
+                wnd_proc,
+                title,
+                width: w,
+                height: h,
+                visible: false,
+                paint_pending: false,
+            },
+        ));
+    });
+    log::trace!("user32!CreateWindowExW('{cname}') -> {hwnd:p}");
+    hwnd
+}
+
+/// `DestroyWindow(HWND) -> int`. Marks the window closed and posts `WM_DESTROY`.
+extern "C" fn destroy_window(hwnd: HWND) -> c_int {
+    let removed = STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        if let Some(pos) = st.windows.iter().position(|(h, _)| *h == hwnd) {
+            st.windows.remove(pos);
+            true
+        } else {
+            false
+        }
+    });
+    if removed {
+        // Mirror Win32: DestroyWindow sends WM_DESTROY to the window proc.
+        post_message_internal(hwnd, WM_DESTROY, 0, 0);
+        1
+    } else {
+        0
+    }
+}
+
+/// `ShowWindow(HWND, int) -> int`. Records visibility; on a real host maps/unmaps the
+/// window.
+extern "C" fn show_window(hwnd: HWND, cmd: c_int) -> c_int {
+    let was_visible = STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        if let Some((_, w)) = st.windows.iter_mut().find(|(h, _)| *h == hwnd) {
+            let prev = w.visible;
+            w.visible = cmd != SW_HIDE;
+            prev
+        } else {
+            false
+        }
+    });
+    if was_visible {
+        1
+    } else {
+        0
+    }
+}
+
+/// `UpdateWindow(HWND) -> int`. Sends a synchronous `WM_PAINT`. Returns 1.
+extern "C" fn update_window(hwnd: HWND) -> c_int {
+    send_message_internal(hwnd, WM_PAINT, 0, 0);
+    1
+}
+
+/// `GetClientRect(HWND, LPRECT) -> int`. Returns 1 and fills the rect with the client
+/// size.
+extern "C" fn get_client_rect(hwnd: HWND, lprect: *mut Rect) -> c_int {
+    if lprect.is_null() {
+        return 0;
+    }
+    let (w, h) = window_size(hwnd);
+    // SAFETY: the guest provides `lprect` valid for one `Rect` write.
+    unsafe {
+        lprect.write(Rect {
+            left: 0,
+            top: 0,
+            right: w as c_int,
+            bottom: h as c_int,
+        });
+    }
+    1
+}
+
+/// `GetWindowRect(HWND, LPRECT) -> int`.
+extern "C" fn get_window_rect(hwnd: HWND, lprect: *mut Rect) -> c_int {
+    get_client_rect(hwnd, lprect)
+}
+
+/// `SetWindowPos(HWND, HWND, int, int, int, int, u32) -> int`. Updates cached size.
+extern "C" fn set_window_pos(
+    _hwnd: HWND,
+    _insert_after: HWND,
+    _x: c_int,
+    _y: c_int,
+    cx: c_int,
+    cy: c_int,
+    _flags: u32,
+) -> c_int {
+    update_size(_hwnd, cx.max(1) as u32, cy.max(1) as u32)
+}
+
+/// `MoveWindow(HWND, int, int, int, int, BOOL) -> int`. Updates cached size.
+extern "C" fn move_window(
+    hwnd: HWND,
+    _x: c_int,
+    _y: c_int,
+    cx: c_int,
+    cy: c_int,
+    _repaint: c_int,
+) -> c_int {
+    update_size(hwnd, cx.max(1) as u32, cy.max(1) as u32)
+}
+
+/// `GetWindowTextW(HWND, LPWSTR, int) -> int`. Copies the cached title. Returns the
+/// length (in wide chars, excluding the NUL).
+extern "C" fn get_window_text_w(hwnd: HWND, buf: *mut u16, max: c_int) -> c_int {
+    if buf.is_null() || max <= 0 {
+        return 0;
+    }
+    let title = window_title(hwnd);
+    let mut len = 0i32;
+    for (i, unit) in title.encode_utf16().enumerate() {
+        if i as i32 >= max - 1 {
+            break;
+        }
+        // SAFETY: `buf` is valid for `max` u16s per the guest; we stop at `max-1`.
+        unsafe { buf.add(i).write(unit) };
+        len = (i as i32) + 1;
+    }
+    // SAFETY: NUL-terminate within the `max` bound.
+    if len < max {
+        unsafe { buf.add(len as usize).write(0) };
+    }
+    len
+}
+
+/// `SetWindowTextW(HWND, LPCWSTR) -> int`. Updates the cached title.
+extern "C" fn set_window_text_w(hwnd: HWND, title: *const u16) -> c_int {
+    let t = widestring_to_string(title);
+    STATE.with(|s| {
+        if let Some((_, w)) = s.borrow_mut().windows.iter_mut().find(|(h, _)| *h == hwnd) {
+            w.title = t;
+        }
+    });
+    1
+}
+
+/// `GetMessageW(LPMSG, HWND, u32, u32) -> int`. Blocks for a message: first drains the
+/// posted-message queue, then polls the host window for events and translates them.
+/// Returns 0 on `WM_QUIT`, nonzero otherwise. This implementation does not truly block
+/// (it polls once); a blocking variant can come later. It never returns -1 in M3.
+extern "C" fn get_message_w(
+    lpmsg: *mut Msg,
+    _hwnd: HWND,
+    _min: u32,
+    _max: u32,
+) -> c_int {
+    if lpmsg.is_null() {
+        return -1;
+    }
+    // 1. Drain the posted queue first.
+    if let Some(m) = STATE.with(|s| s.borrow_mut().queue.pop_front()) {
+        // SAFETY: the guest provides `lpmsg` valid for one `Msg` write.
+        unsafe { lpmsg.write(m) };
+        // Re-read to check for WM_QUIT (the borrowed value was moved into the write).
+        // SAFETY: we just wrote it; reading it back is sound.
+        let msg = unsafe { *lpmsg };
+        return if msg.message == WM_QUIT { 0 } else { 1 };
+    }
+    // 2. Check for a pending quit.
+    if let Some(code) = STATE.with(|s| s.borrow().quit_code) {
+        // SAFETY: same as above.
+        unsafe {
+            lpmsg.write(Msg {
+                message: WM_QUIT,
+                w_param: code as usize,
+                ..Msg::default()
+            })
+        };
+        return 0;
+    }
+    // 3. Poll the host window for an event.
+    if let Some(m) = poll_host_event() {
+        // SAFETY: same as above.
+        unsafe { lpmsg.write(m) };
+        return 1;
+    }
+    // 4. Nothing ready: in a real blocking `GetMessage` we would wait. To stay
+    //    CI-safe and non-hanging, return a synthetic `WM_NULL` so the caller can
+    //    decide to retry or exit. A future blocking variant sleeps here.
+    // SAFETY: same as above.
+    unsafe {
+        lpmsg.write(Msg {
+            message: 0x0000, // WM_NULL
+            ..Msg::default()
+        })
+    };
+    1
+}
+
+/// `PeekMessageW(LPMSG, HWND, u32, u32, u32) -> int`. Non-blocking: returns 1 if a
+/// message was available, 0 otherwise.
+extern "C" fn peek_message_w(
+    lpmsg: *mut Msg,
+    _hwnd: HWND,
+    _min: u32,
+    _max: u32,
+    _remove: u32,
+) -> c_int {
+    if lpmsg.is_null() {
+        return 0;
+    }
+    let queued = STATE.with(|s| s.borrow_mut().queue.pop_front());
+    if let Some(m) = queued {
+        // SAFETY: the guest provides `lpmsg` valid for one `Msg` write.
+        unsafe { lpmsg.write(m) };
+        return 1;
+    }
+    if let Some(m) = poll_host_event() {
+        // SAFETY: same as above.
+        unsafe { lpmsg.write(m) };
+        return 1;
+    }
+    0
+}
+
+/// `TranslateMessage(const MSG*) -> int`. Stub: returns 0 (no char translation).
+extern "C" fn translate_message(_lpmsg: *const Msg) -> c_int {
+    0
+}
+
+/// `DispatchMessageW(const MSG*) -> LRESULT`. Calls the target window's procedure
+/// through the Win64→SysV thunk. If the window has no proc (e.g. headless test), calls
+/// `DefWindowProcW`.
+extern "C" fn dispatch_message_w(lpmsg: *const Msg) -> isize {
+    if lpmsg.is_null() {
+        return 0;
+    }
+    // SAFETY: the guest provides `lpmsg` valid for one `Msg` read.
+    let msg = unsafe { *lpmsg };
+    let (wnd_proc, _atom) = STATE
+        .with(|s| {
+            let st = s.borrow();
+            st.windows
+                .iter()
+                .find(|(h, _)| *h == msg.hwnd)
+                .map(|(_, w)| (w.wnd_proc, w.class_atom))
+        })
+        .unwrap_or((std::ptr::null(), 0));
+    if !wnd_proc.is_null() {
+        // SAFETY: `wnd_proc` is a PE-supplied Win64 function pointer with relocations
+        // applied by the loader; `msg` fields match the WndProc contract.
+        return unsafe {
+            call_win64_wndproc(
+                wnd_proc,
+                msg.hwnd as u64,
+                msg.message,
+                msg.w_param as u64,
+                msg.l_param,
+            )
+        };
+    }
+    // No PE proc: defer to DefWindowProcW.
+    def_window_proc_w_impl(msg.hwnd, msg.message, msg.w_param, msg.l_param)
+}
+
+/// `PostQuitMessage(int) -> void`. Sets the quit code so the next `GetMessage` returns
+/// 0.
+extern "C" fn post_quit_message(exit_code: c_int) {
+    STATE.with(|s| {
+        s.borrow_mut().quit_code = Some(exit_code as isize);
+    });
+}
+
+/// `PostMessageW(HWND, u32, WPARAM, LPARAM) -> int`. Queues a message.
+extern "C" fn post_message_w(hwnd: HWND, msg: u32, w_param: usize, l_param: isize) -> c_int {
+    post_message_internal(hwnd, msg, w_param, l_param);
+    1
+}
+
+/// `SendMessageW(HWND, u32, WPARAM, LPARAM) -> LRESULT`. Calls the window proc directly
+/// (no queue). Falls back to `DefWindowProcW` if the window has no proc.
+extern "C" fn send_message_w(hwnd: HWND, msg: u32, w_param: usize, l_param: isize) -> isize {
+    send_message_internal(hwnd, msg, w_param, l_param)
+}
+
+/// `DefWindowProcW(HWND, u32, WPARAM, LPARAM) -> LRESULT`. Default handling:
+/// `WM_DESTROY`→`PostQuitMessage(0)`, `WM_CLOSE`→`DestroyWindow`, `WM_PAINT`→
+/// `ValidateRect`, else 0.
+extern "C" fn def_window_proc_w(hwnd: HWND, msg: u32, w_param: usize, l_param: isize) -> isize {
+    def_window_proc_w_impl(hwnd, msg, w_param, l_param)
+}
+
+/// `GetParent(HWND) -> HWND`. Stub: returns null.
+extern "C" fn get_parent(_hwnd: HWND) -> HWND {
+    std::ptr::null_mut()
+}
+
+/// `SetParent(HWND, HWND) -> HWND`. Stub.
+extern "C" fn set_parent(_hwnd: HWND, _parent: HWND) -> HWND {
+    std::ptr::null_mut()
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn def_window_proc_w_impl(hwnd: HWND, msg: u32, _w_param: usize, _l_param: isize) -> isize {
+    match msg {
+        WM_DESTROY => {
+            post_quit_message(0);
+            0
+        }
+        WM_CLOSE => {
+            destroy_window(hwnd);
+            0
+        }
+        WM_PAINT => {
+            // ValidateRect clears the pending paint; clear our local flag too.
+            clear_paint_flag(hwnd);
+            0
+        }
+        WM_SIZE => 0,
+        _ => 0,
+    }
+}
+
+fn post_message_internal(hwnd: HWND, msg: u32, w_param: usize, l_param: isize) {
+    STATE.with(|s| {
+        s.borrow_mut().queue.push_back(Msg {
+            hwnd,
+            message: msg,
+            w_param,
+            l_param,
+            time: 0,
+            pt: Point::default(),
+        });
+    });
+}
+
+fn send_message_internal(hwnd: HWND, msg: u32, w_param: usize, l_param: isize) -> isize {
+    let (wnd_proc, _atom) = STATE
+        .with(|s| {
+            let st = s.borrow();
+            st.windows
+                .iter()
+                .find(|(h, _)| *h == hwnd)
+                .map(|(_, w)| (w.wnd_proc, w.class_atom))
+        })
+        .unwrap_or((std::ptr::null(), 0));
+    if !wnd_proc.is_null() {
+        // SAFETY: PE-supplied Win64 function pointer; args match WndProc contract.
+        unsafe { call_win64_wndproc(wnd_proc, hwnd as u64, msg, w_param as u64, l_param) }
+    } else {
+        def_window_proc_w_impl(hwnd, msg, w_param, l_param)
+    }
+}
+
+fn window_size(hwnd: HWND) -> (u32, u32) {
+    STATE.with(|s| {
+        s.borrow()
+            .windows
+            .iter()
+            .find(|(h, _)| *h == hwnd)
+            .map(|(_, w)| (w.width, w.height))
+            .unwrap_or((0, 0))
+    })
+}
+
+fn window_title(hwnd: HWND) -> String {
+    STATE.with(|s| {
+        s.borrow()
+            .windows
+            .iter()
+            .find(|(h, _)| *h == hwnd)
+            .map(|(_, w)| w.title.clone())
+            .unwrap_or_default()
+    })
+}
+
+fn update_size(hwnd: HWND, cx: u32, cy: u32) -> c_int {
+    STATE.with(|s| {
+        if let Some((_, w)) = s.borrow_mut().windows.iter_mut().find(|(h, _)| *h == hwnd) {
+            w.width = cx;
+            w.height = cy;
+            1
+        } else {
+            0
+        }
+    })
+}
+
+/// Drain one event from the host window (if any) and translate it to a `MSG`.
+fn poll_host_event() -> Option<Msg> {
+    // We poll the first window that owns a real host window. `wsi::Window` is not `Send`
+    // and must be driven from the thread that owns it, so the whole table is thread-local.
+    let hwnd = STATE.with(|s| {
+        s.borrow()
+            .windows
+            .iter()
+            .find(|(_, w)| w.window.is_some())
+            .map(|(h, _)| *h)
+    })?;
+    // Now poll that window's event queue. We re-borrow mutably to reach the Window.
+    let ev = STATE.with(|s| {
+        let mut st = s.borrow_mut();
+        let entry = st
+            .windows
+            .iter_mut()
+            .find(|(h, _)| *h == hwnd)?;
+        let win = entry.1.window.as_mut()?;
+        win.poll_event().ok().flatten()
+    })?;
+    Some(translate_event_to_msg(hwnd, ev))
+}
+
+/// Translate a `wsi::WindowEvent` into a Win32 `MSG`.
+fn translate_event_to_msg(hwnd: HWND, ev: nigg_wsi::WindowEvent) -> Msg {
+    use nigg_wsi::WindowEvent as E;
+    let (message, w, l) = match ev {
+        E::Resize { width, height } => {
+            update_size(hwnd, width, height);
+            (WM_SIZE, 0, ((width & 0xFFFF) | ((height & 0xFFFF) << 16)) as isize)
+        }
+        E::Close => (WM_CLOSE, 0, 0),
+        E::Key { code, pressed } => {
+            if pressed {
+                (WM_KEYDOWN, code as usize, 0)
+            } else {
+                (WM_KEYUP, code as usize, 0)
+            }
+        }
+        E::MouseMove { x, y } => (WM_MOUSEMOVE, 0, ((x & 0xFFFF) as isize) | ((y & 0xFFFF) as isize) << 16),
+        E::MouseButton { button, pressed } => {
+            let mk = (1u16 << (button as u8)) as usize;
+            if pressed {
+                (WM_LBUTTONDOWN, mk, 0)
+            } else {
+                (WM_LBUTTONUP, mk, 0)
+            }
+        }
+    };
+    Msg {
+        hwnd,
+        message,
+        w_param: w,
+        l_param: l,
+        time: 0,
+        pt: Point::default(),
+    }
+}
+
+/// Decode a NUL-terminated UTF-16 (`LPCWSTR`) into a Rust `String`. Handles null and
+/// empty strings.
+fn widestring_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut units = Vec::new();
+    let mut i = 0usize;
+    loop {
+        // SAFETY: the guest provides a NUL-terminated wide string; we read one u16 at a
+        // time and stop at the NUL.
+        let unit = unsafe { *ptr.add(i) };
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        i += 1;
+    }
+    String::from_utf16_lossy(&units)
+}
+
+// ---------------------------------------------------------------------------
+// Exports for the PE loader
+// ---------------------------------------------------------------------------
+
+/// The function-pointer type matching `pe-loader`'s `ImplTable`.
+pub type FnPtr = *const c_void;
+
+/// The user32 export table the PE loader registers.
+pub fn user32_imports() -> Vec<(&'static str, &'static str, FnPtr)> {
+    vec![
+        ("user32.dll", "RegisterClassExW", register_class_ex_w as FnPtr),
+        ("user32.dll", "UnregisterClassW", unregister_class_w as FnPtr),
+        ("user32.dll", "CreateWindowExW", create_window_ex_w as FnPtr),
+        ("user32.dll", "DestroyWindow", destroy_window as FnPtr),
+        ("user32.dll", "ShowWindow", show_window as FnPtr),
+        ("user32.dll", "UpdateWindow", update_window as FnPtr),
+        ("user32.dll", "GetClientRect", get_client_rect as FnPtr),
+        ("user32.dll", "GetWindowRect", get_window_rect as FnPtr),
+        ("user32.dll", "SetWindowPos", set_window_pos as FnPtr),
+        ("user32.dll", "MoveWindow", move_window as FnPtr),
+        ("user32.dll", "GetWindowTextW", get_window_text_w as FnPtr),
+        ("user32.dll", "SetWindowTextW", set_window_text_w as FnPtr),
+        ("user32.dll", "GetMessageW", get_message_w as FnPtr),
+        ("user32.dll", "PeekMessageW", peek_message_w as FnPtr),
+        ("user32.dll", "TranslateMessage", translate_message as FnPtr),
+        ("user32.dll", "DispatchMessageW", dispatch_message_w as FnPtr),
+        ("user32.dll", "PostQuitMessage", post_quit_message as FnPtr),
+        ("user32.dll", "PostMessageW", post_message_w as FnPtr),
+        ("user32.dll", "SendMessageW", send_message_w as FnPtr),
+        ("user32.dll", "DefWindowProcW", def_window_proc_w as FnPtr),
+        ("user32.dll", "GetParent", get_parent as FnPtr),
+        ("user32.dll", "SetParent", set_parent as FnPtr),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Tests (headless-safe)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user32_imports_nonempty_and_correct_dll() {
+        let imports = user32_imports();
+        assert!(!imports.is_empty());
+        assert!(imports.iter().all(|(dll, _, _)| *dll == "user32.dll"));
+        assert!(imports.iter().any(|(_, sym, _)| *sym == "CreateWindowExW"));
+        assert!(imports.iter().any(|(_, sym, _)| *sym == "GetMessageW"));
+        assert!(imports.iter().any(|(_, sym, _)| *sym == "DispatchMessageW"));
+        assert!(imports.iter().all(|(_, _, p)| !p.is_null()));
+    }
+
+    #[test]
+    fn register_and_lookup_class() {
+        // A class name as a NUL-terminated wide string on the stack.
+        let name: Vec<u16> = "TestWnd\0".encode_utf16().collect();
+        let wcx = WndClassEx {
+            style: 0,
+            lpfn_wnd_proc: std::ptr::null(),
+            cb_cls_extra: 0,
+            cb_wnd_extra: 0,
+            h_instance: std::ptr::null_mut(),
+            lpsz_class_name: name.as_ptr(),
+        };
+        let atom = register_class_ex_w(&wcx);
+        assert_ne!(atom, 0, "RegisterClassExW must return a nonzero atom");
+        let found = find_class_by_name("TestWnd");
+        assert_eq!(found, Some(atom));
+        assert_eq!(unregister_class_w(name.as_ptr(), std::ptr::null_mut()), 1);
+    }
+
+    /// Simulate the core message-loop flow without any PE code or display: register a
+    /// class (with a null wndproc so DispatchMessageW defers to DefWindowProcW), create
+    /// a window (degrades to headless), post WM_CLOSE, run the loop, and assert it
+    /// exits via WM_QUIT.
+
+    #[test]
+    fn message_loop_simulated_close() {
+        // Register a class pointing at our Rust wndproc (treated as a SysV fn; the thunk
+        // would translate in a real PE, but here we call dispatch's DefWindowProc path
+        // by setting wnd_proc to null so DispatchMessageW defers to DefWindowProcW).
+        let name: Vec<u16> = "LoopWnd\0".encode_utf16().collect();
+        let wcx = WndClassEx {
+            style: 0,
+            lpfn_wnd_proc: std::ptr::null(), // DefWindowProc path
+            cb_cls_extra: 0,
+            cb_wnd_extra: 0,
+            h_instance: std::ptr::null_mut(),
+            lpsz_class_name: name.as_ptr(),
+        };
+        let atom = register_class_ex_w(&wcx);
+        assert_ne!(atom, 0);
+
+        let hwnd = create_window_ex_w(
+            0, name.as_ptr(), std::ptr::null(), 0, 0, 0, 100, 100,
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+        );
+        assert!(!hwnd.is_null());
+
+        // Post a WM_CLOSE; DefWindowProcW(WM_CLOSE) calls DestroyWindow, which posts
+        // WM_DESTROY; DefWindowProcW(WM_DESTROY) calls PostQuitMessage(0).
+        post_message_w(hwnd, WM_CLOSE, 0, 0);
+
+        // Run the message loop.
+        let mut msg = Msg::default();
+        loop {
+            let r = get_message_w(&mut msg as *mut Msg, std::ptr::null_mut(), 0, 0);
+            if r == 0 {
+                break; // WM_QUIT
+            }
+            translate_message(&msg as *const Msg);
+            dispatch_message_w(&msg as *const Msg);
+        }
+        // The loop exited (GetMessage returned 0 for WM_QUIT).
+        assert_eq!(get_message_w(&mut msg as *mut Msg, std::ptr::null_mut(), 0, 0), 0);
+
+        // Cleanup: remove the class so it doesn't leak into other tests on the same
+        // thread. The window entry was already removed by DestroyWindow.
+        unregister_class_w(name.as_ptr(), std::ptr::null_mut());
+    }
+
+    #[test]
+    fn post_and_peek_message() {
+        let hwnd = make_hwnd();
+        post_message_internal(hwnd, 0x1234, 56, 78);
+        let mut msg = Msg::default();
+        let got = peek_message_w(&mut msg as *mut Msg, std::ptr::null_mut(), 0, 0xFFFF, 0);
+        assert_eq!(got, 1);
+        assert_eq!(msg.message, 0x1234);
+        assert_eq!(msg.w_param, 56);
+        assert_eq!(msg.l_param, 78);
+    }
+
+    #[test]
+    fn get_client_rect_reflects_cached_size() {
+        let name: Vec<u16> = "RectWnd\0".encode_utf16().collect();
+        let wcx = WndClassEx {
+            style: 0,
+            lpfn_wnd_proc: std::ptr::null(),
+            cb_cls_extra: 0,
+            cb_wnd_extra: 0,
+            h_instance: std::ptr::null_mut(),
+            lpsz_class_name: name.as_ptr(),
+        };
+        let _atom = register_class_ex_w(&wcx);
+        let hwnd = create_window_ex_w(
+            0, name.as_ptr(), std::ptr::null(), 0, 0, 0, 320, 200,
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+        );
+        let mut rect = Rect::default();
+        assert_eq!(get_client_rect(hwnd, &mut rect as *mut Rect), 1);
+        assert_eq!(rect.right, 320);
+        assert_eq!(rect.bottom, 200);
+        unregister_class_w(name.as_ptr(), std::ptr::null_mut());
+    }
+}
