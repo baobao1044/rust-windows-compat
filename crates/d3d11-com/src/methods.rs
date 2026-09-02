@@ -106,6 +106,124 @@ pub(crate) struct ShaderInner {
     pub shader: nigg_d3d11::Shader,
 }
 
+/// An input layout: the owned copy of the D3D11 input-element descriptions.
+/// The native pipeline currently hardcodes a single `float2` position binding
+/// (matching the triangle sample), so the stored layout is kept for correctness
+/// and future milestones but is not yet consumed by the draw path.
+pub(crate) struct InputLayoutInner {
+    pub elements: Vec<InputElementDesc>,
+}
+
+/// Opaque state objects (rasterizer/blend/depth-stencil/sampler/view). The
+/// triangle sample never sets any of them (the native draw uses defaults), so
+/// they are pure IUnknown shells: the PE can create and `Release` them, which
+/// is enough to drive the D3D11 API surface end-to-end.
+pub(crate) struct RasterizerStateInner;
+pub(crate) struct BlendStateInner;
+pub(crate) struct DepthStencilStateInner;
+pub(crate) struct DepthStencilViewInner;
+pub(crate) struct SamplerStateInner;
+
+// ---------------------------------------------------------------------------
+// Windows-side D3D11 description structs (the `#[repr(C)]` layouts a PE fills)
+// ---------------------------------------------------------------------------
+
+/// `D3D11_BUFFER_DESC` subset. Only `ByteWidth` and `BindFlags` are read; the
+/// remaining fields are accepted and ignored for M7b.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct D3d11BufferDescWin {
+    pub byte_width: u32,
+    pub usage: u32,
+    pub bind_flags: u32,
+    pub cpu_access_flags: u32,
+    pub misc_flags: u32,
+    pub structure_byte_stride: u32,
+}
+
+/// `D3D11_SUBRESOURCE_DATA`: the host pointer + pitches for initial data.
+#[repr(C)]
+pub(crate) struct D3d11SubresourceDataWin {
+    pub p_sys_mem: *const c_void,
+    pub sys_mem_pitch: u32,
+    pub sys_mem_slice_pitch: u32,
+}
+
+/// `D3D11_INPUT_ELEMENT_DESC` as the PE lays it out. `SemanticName` is a
+/// NUL-terminated C string borrowed from the PE; we copy it into an owned
+/// [`InputElementDesc`] so the layout outlives the call.
+#[repr(C)]
+#[derive(Clone)]
+pub(crate) struct D3d11InputElementDescWin {
+    pub semantic_name: *const u8,
+    pub semantic_index: u32,
+    pub format: u32,
+    pub input_slot: u32,
+    pub aligned_byte_offset: u32,
+    pub input_slot_class: u32,
+    pub instance_data_step_rate: u32,
+}
+
+/// Owned copy of a single input-element description (the semantic name is an
+/// owned `String`, so it does not dangle after the PE call returns).
+#[derive(Clone)]
+pub(crate) struct InputElementDesc {
+    pub semantic_name: String,
+    pub semantic_index: u32,
+    pub format: u32,
+    pub input_slot: u32,
+    pub aligned_byte_offset: u32,
+    pub input_slot_class: u32,
+    pub instance_data_step_rate: u32,
+}
+
+/// `D3D11_BIND_VERTEX_BUFFER` (0x1), `...INDEX_BUFFER` (0x2),
+/// `...CONSTANT_BUFFER` (0x4).
+fn map_bind_flags(flags: u32) -> nigg_d3d11::BufferUsage {
+    if flags & 0x4 != 0 {
+        nigg_d3d11::BufferUsage::Constant
+    } else if flags & 0x2 != 0 {
+        nigg_d3d11::BufferUsage::Index
+    } else {
+        nigg_d3d11::BufferUsage::Vertex
+    }
+}
+
+/// `D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST` = 4. The native pipeline hardcodes
+/// `TRIANGLE_LIST`, so any non-triangle topology is logged and still drawn as
+/// triangles (M7b only exercises the triangle-list path).
+fn map_topology(topology: u32) {
+    if topology != 4 {
+        log::warn!("d3d11-com: IASetPrimitiveTopology({topology}) — only TRIANGLELIST (4) is honoured by the native pipeline; drawing as triangles");
+    }
+}
+
+/// Reinterpret a SPIR-V byte blob as the little-endian `u32` word stream the
+/// native `create_shader` expects. Returns `None` if the length is not a
+/// whole number of words.
+///
+/// # Safety
+/// `bytes` must be a valid SPIR-V bytecode pointer of `len` readable bytes,
+/// exactly as the PE hands it to `CreateVertexShader`/`CreatePixelShader`.
+//
+// `is_multiple_of` (clippy's suggestion) was stabilised in Rust 1.87, but the
+// workspace MSRV is 1.75, so the manual `%` check is kept.
+#[allow(clippy::manual_is_multiple_of)]
+unsafe fn spirv_bytes_to_words(bytes: *const u8, len: usize) -> Option<Vec<u32>> {
+    if len == 0 || len % 4 != 0 || bytes.is_null() {
+        return None;
+    }
+    // SAFETY: caller upholds that `bytes..bytes+len` is valid for reading.
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+    let n = len / 4;
+    let mut words = Vec::with_capacity(n);
+    for i in 0..n {
+        let b = &slice[i * 4..i * 4 + 4];
+        words.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    Some(words)
+}
+
 // ---------------------------------------------------------------------------
 // Vtable structs (slots are `*const c_void` = 8 bytes, identical to fn ptrs)
 // ---------------------------------------------------------------------------
@@ -202,6 +320,12 @@ iunknown_vtbl!(Id3d11RenderTargetViewVtbl);
 iunknown_vtbl!(Id3d11BufferVtbl);
 iunknown_vtbl!(Id3d11VertexShaderVtbl);
 iunknown_vtbl!(Id3d11PixelShaderVtbl);
+iunknown_vtbl!(Id3d11InputLayoutVtbl);
+// Generic IUnknown vtable shared by the opaque state objects
+// (rasterizer/blend/depth-stencil-state/depth-stencil-view/sampler). They are
+// pure shells the PE can create and `Release`; the shared IUnknown thunks
+// suffice because `Release` operates on the `ComHeader` prefix.
+iunknown_vtbl!(Id3d11StateVtbl);
 
 // ---------------------------------------------------------------------------
 // IDXGISwapChain methods
@@ -358,42 +482,321 @@ extern "C" fn stub_create4(
     E_NOTIMPL
 }
 
-extern "C" fn stub_create_shader(
-    _this: *mut c_void,
-    _a: *const u8,
-    _b: usize,
-    _c: *mut c_void,
-    _d: *mut *mut c_void,
+// ---------------------------------------------------------------------------
+// ID3D11Device creators (triangle path)
+// ---------------------------------------------------------------------------
+
+/// `ID3D11Device::CreateVertexShader(pShaderBytecode, BytecodeLength,
+/// pClassLinkage, ppVertexShader)`. Builds a `VkShaderModule` from the SPIR-V
+/// bytecode via the native `Device::create_shader(Vertex)`, wraps it in a
+/// `ComObject<ShaderInner>` with the vertex-shader vtable, and returns the
+/// interface pointer. `pClassLinkage` is ignored (no class linkage in M7b).
+extern "C" fn device_create_vertex_shader(
+    this: *mut c_void,
+    p_shader_bytecode: *const u8,
+    bytecode_length: usize,
+    _p_class_linkage: *mut c_void,
+    pp_vertex_shader: *mut *mut c_void,
 ) -> i32 {
-    E_NOTIMPL
+    if pp_vertex_shader.is_null() || p_shader_bytecode.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `p_shader_bytecode` is a SPIR-V byte blob of `bytecode_length`
+    // readable bytes per the D3D11 contract; `this` is a live device COM object.
+    let words = unsafe { spirv_bytes_to_words(p_shader_bytecode, bytecode_length) };
+    let words = match words {
+        Some(w) => w,
+        None => {
+            log::warn!("d3d11-com: CreateVertexShader: invalid bytecode length {bytecode_length}");
+            return E_INVALIDARG;
+        }
+    };
+    // SAFETY: `this` is a live device COM object allocated by `into_raw`.
+    let dev = unsafe { inner::<DeviceInner>(this) };
+    match dev
+        .device
+        .create_shader(&words, nigg_d3d11::ShaderStage::Vertex)
+    {
+        Ok(shader) => {
+            // SAFETY: freshly built COM object with the pre-allocated vtable.
+            let ptr = crate::ComObject::into_raw(
+                vtables().vertex_shader as *const c_void,
+                ShaderInner { shader },
+            );
+            // SAFETY: `pp_vertex_shader` is a valid out-pointer per the contract.
+            unsafe { *pp_vertex_shader = ptr };
+            S_OK
+        }
+        Err(e) => {
+            log::warn!("d3d11-com: CreateVertexShader failed: {e}");
+            E_FAIL
+        }
+    }
 }
 
-extern "C" fn stub_create_input_layout(
-    _this: *mut c_void,
-    _a: *const c_void,
-    _b: u32,
-    _c: *const u8,
-    _d: usize,
-    _e: *mut *mut c_void,
+/// `ID3D11Device::CreatePixelShader` — the pixel-stage twin of
+/// [`device_create_vertex_shader`].
+extern "C" fn device_create_pixel_shader(
+    this: *mut c_void,
+    p_shader_bytecode: *const u8,
+    bytecode_length: usize,
+    _p_class_linkage: *mut c_void,
+    pp_pixel_shader: *mut *mut c_void,
 ) -> i32 {
-    E_NOTIMPL
+    if pp_pixel_shader.is_null() || p_shader_bytecode.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `p_shader_bytecode` is a SPIR-V byte blob of `bytecode_length`
+    // readable bytes per the D3D11 contract; `this` is a live device COM object.
+    let words = unsafe { spirv_bytes_to_words(p_shader_bytecode, bytecode_length) };
+    let words = match words {
+        Some(w) => w,
+        None => {
+            log::warn!("d3d11-com: CreatePixelShader: invalid bytecode length {bytecode_length}");
+            return E_INVALIDARG;
+        }
+    };
+    // SAFETY: `this` is a live device COM object allocated by `into_raw`.
+    let dev = unsafe { inner::<DeviceInner>(this) };
+    match dev
+        .device
+        .create_shader(&words, nigg_d3d11::ShaderStage::Pixel)
+    {
+        Ok(shader) => {
+            // SAFETY: freshly built COM object with the pre-allocated vtable.
+            let ptr = crate::ComObject::into_raw(
+                vtables().pixel_shader as *const c_void,
+                ShaderInner { shader },
+            );
+            // SAFETY: `pp_pixel_shader` is a valid out-pointer per the contract.
+            unsafe { *pp_pixel_shader = ptr };
+            S_OK
+        }
+        Err(e) => {
+            log::warn!("d3d11-com: CreatePixelShader failed: {e}");
+            E_FAIL
+        }
+    }
 }
 
-extern "C" fn stub_create_state(
-    _this: *mut c_void,
-    _a: *const c_void,
-    _b: *mut *mut c_void,
+/// `ID3D11Device::CreateBuffer(pDesc, pInitialData, ppBuffer)`. Reads the
+/// Windows `D3D11_BUFFER_DESC` (ByteWidth + BindFlags), maps the bind flags to
+/// a `BufferUsage`, optionally copies the initial data from the
+/// `D3D11_SUBRESOURCE_DATA` host pointer, and delegates to the native
+/// `Device::create_buffer`.
+extern "C" fn device_create_buffer(
+    this: *mut c_void,
+    p_desc: *const D3d11BufferDescWin,
+    p_initial_data: *const D3d11SubresourceDataWin,
+    pp_buffer: *mut *mut c_void,
 ) -> i32 {
-    E_NOTIMPL
+    if pp_buffer.is_null() || p_desc.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `p_desc` is a valid `D3D11_BUFFER_DESC` provided by the PE; `this`
+    // is a live device COM object. `p_initial_data` may be null (no init data).
+    let (desc_win, initial) = unsafe {
+        let desc = &*p_desc;
+        let initial = if p_initial_data.is_null() {
+            None
+        } else {
+            // SAFETY: `p_initial_data` is a valid `D3D11_SUBRESOURCE_DATA` per
+            // the contract; `p_sys_mem` points to `byte_width` readable bytes.
+            let data = &*p_initial_data;
+            if data.p_sys_mem.is_null() {
+                None
+            } else {
+                Some(std::slice::from_raw_parts(
+                    data.p_sys_mem as *const u8,
+                    desc.byte_width as usize,
+                ))
+            }
+        };
+        (desc, initial)
+    };
+    let native_desc = nigg_d3d11::BufferDesc {
+        size: desc_win.byte_width as u64,
+        usage: map_bind_flags(desc_win.bind_flags),
+    };
+    // SAFETY: `this` is a live device COM object allocated by `into_raw`.
+    let dev = unsafe { inner::<DeviceInner>(this) };
+    match dev.device.create_buffer(native_desc, initial) {
+        Ok(buffer) => {
+            // SAFETY: freshly built COM object with the pre-allocated vtable.
+            let ptr = crate::ComObject::into_raw(
+                vtables().buffer as *const c_void,
+                BufferInner { buffer },
+            );
+            // SAFETY: `pp_buffer` is a valid out-pointer per the contract.
+            unsafe { *pp_buffer = ptr };
+            S_OK
+        }
+        Err(e) => {
+            log::warn!("d3d11-com: CreateBuffer failed: {e}");
+            E_FAIL
+        }
+    }
 }
 
-extern "C" fn stub_create_dsv(
-    _this: *mut c_void,
-    _a: *mut c_void,
-    _b: *const c_void,
-    _c: *mut *mut c_void,
+/// `ID3D11Device::CreateInputLayout(pInputElementDescs, NumElements,
+/// pShaderBytecode, BytecodeLength, ppInputLayout)`. Copies the input-element
+/// descriptions (owning the semantic-name strings) into a
+/// `ComObject<InputLayoutInner>`. The native pipeline currently hardcodes the
+/// `float2 POSITION` vertex binding, so the layout is stored for correctness
+/// but not yet consumed by the draw path.
+extern "C" fn device_create_input_layout(
+    this: *mut c_void,
+    p_input_element_descs: *const D3d11InputElementDescWin,
+    num_elements: u32,
+    _p_shader_bytecode: *const u8,
+    _bytecode_length: usize,
+    pp_input_layout: *mut *mut c_void,
 ) -> i32 {
-    E_NOTIMPL
+    if pp_input_layout.is_null() {
+        return E_INVALIDARG;
+    }
+    if p_input_element_descs.is_null() && num_elements != 0 {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `p_input_element_descs` points to `num_elements` valid
+    // `D3D11_INPUT_ELEMENT_DESC` structs per the contract.
+    let descs: Vec<D3d11InputElementDescWin> = if num_elements == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: `p_input_element_descs` points to `num_elements` valid structs
+        // per the D3D11 contract; copying them into an owned Vec keeps them
+        // valid beyond the (borrowed) PE-side lifetime.
+        unsafe { std::slice::from_raw_parts(p_input_element_descs, num_elements as usize).to_vec() }
+    };
+    let mut elements = Vec::with_capacity(descs.len());
+    for d in descs {
+        // SAFETY: `semantic_name` is a NUL-terminated C string per the contract.
+        let name = if d.semantic_name.is_null() {
+            String::new()
+        } else {
+            unsafe { c_str_to_string(d.semantic_name) }
+        };
+        elements.push(InputElementDesc {
+            semantic_name: name,
+            semantic_index: d.semantic_index,
+            format: d.format,
+            input_slot: d.input_slot,
+            aligned_byte_offset: d.aligned_byte_offset,
+            input_slot_class: d.input_slot_class,
+            instance_data_step_rate: d.instance_data_step_rate,
+        });
+    }
+    // `this` is only used to validate the device is live; the layout does not
+    // need device resources. Keep the borrow to mirror the other creators.
+    // SAFETY: `this` is a live device COM object allocated by `into_raw`.
+    let _ = unsafe { inner::<DeviceInner>(this) };
+    let ptr = crate::ComObject::into_raw(
+        vtables().input_layout as *const c_void,
+        InputLayoutInner { elements },
+    );
+    // SAFETY: `pp_input_layout` is a valid out-pointer per the contract.
+    unsafe { *pp_input_layout = ptr };
+    S_OK
+}
+
+/// Copy a NUL-terminated C string into an owned `String`.
+///
+/// # Safety
+/// `p` must point to a valid NUL-terminated UTF-8 byte string.
+unsafe fn c_str_to_string(p: *const u8) -> String {
+    // SAFETY: `p` is a valid NUL-terminated C string; the loop reads up to the
+    // NUL, which is within the allocation per the contract.
+    let len = unsafe {
+        let mut n = 0usize;
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+        n
+    };
+    // SAFETY: `p..p+len` are valid, non-NUL bytes; copying them into a String
+    // via the byte slice is sound.
+    let bytes = unsafe { std::slice::from_raw_parts(p, len) };
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// `ID3D11Device::CreateRasterizerState(pDesc, ppRasterizerState)` — stores the
+/// desc opaquely and returns a shell `ComObject`. The native draw uses defaults.
+extern "C" fn device_create_rasterizer_state(
+    _this: *mut c_void,
+    _p_desc: *const c_void,
+    pp: *mut *mut c_void,
+) -> i32 {
+    if pp.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: freshly built COM object with the shared state vtable.
+    let ptr = crate::ComObject::into_raw(vtables().state as *const c_void, RasterizerStateInner);
+    // SAFETY: `pp` is a valid out-pointer per the contract.
+    unsafe { *pp = ptr };
+    S_OK
+}
+
+/// `ID3D11Device::CreateBlendState` — shell `ComObject` (see
+/// [`device_create_rasterizer_state`]).
+extern "C" fn device_create_blend_state(
+    _this: *mut c_void,
+    _p_desc: *const c_void,
+    pp: *mut *mut c_void,
+) -> i32 {
+    if pp.is_null() {
+        return E_INVALIDARG;
+    }
+    let ptr = crate::ComObject::into_raw(vtables().state as *const c_void, BlendStateInner);
+    // SAFETY: `pp` is a valid out-pointer per the contract.
+    unsafe { *pp = ptr };
+    S_OK
+}
+
+/// `ID3D11Device::CreateDepthStencilState` — shell `ComObject`.
+extern "C" fn device_create_depth_stencil_state(
+    _this: *mut c_void,
+    _p_desc: *const c_void,
+    pp: *mut *mut c_void,
+) -> i32 {
+    if pp.is_null() {
+        return E_INVALIDARG;
+    }
+    let ptr = crate::ComObject::into_raw(vtables().state as *const c_void, DepthStencilStateInner);
+    // SAFETY: `pp` is a valid out-pointer per the contract.
+    unsafe { *pp = ptr };
+    S_OK
+}
+
+/// `ID3D11Device::CreateDepthStencilView(pResource, pDesc, ppDepthStencilView)`
+/// — shell `ComObject`. The triangle sample uses no depth/stencil.
+extern "C" fn device_create_depth_stencil_view(
+    _this: *mut c_void,
+    _p_resource: *mut c_void,
+    _p_desc: *const c_void,
+    pp: *mut *mut c_void,
+) -> i32 {
+    if pp.is_null() {
+        return E_INVALIDARG;
+    }
+    let ptr = crate::ComObject::into_raw(vtables().state as *const c_void, DepthStencilViewInner);
+    // SAFETY: `pp` is a valid out-pointer per the contract.
+    unsafe { *pp = ptr };
+    S_OK
+}
+
+/// `ID3D11Device::CreateSamplerState` — shell `ComObject`.
+extern "C" fn device_create_sampler_state(
+    _this: *mut c_void,
+    _p_desc: *const c_void,
+    pp: *mut *mut c_void,
+) -> i32 {
+    if pp.is_null() {
+        return E_INVALIDARG;
+    }
+    let ptr = crate::ComObject::into_raw(vtables().state as *const c_void, SamplerStateInner);
+    // SAFETY: `pp` is a valid out-pointer per the contract.
+    unsafe { *pp = ptr };
+    S_OK
 }
 
 // ---------------------------------------------------------------------------
@@ -459,31 +862,153 @@ extern "C" fn context_flush(this: *mut c_void) {
     }
 }
 
-// No-op stubs for the context setters/draws the clear sample does not call.
-// These are `void` in D3D11; a no-op keeps callers happy. Plain safe fns.
-extern "C" fn noop0(_this: *mut c_void) {}
-extern "C" fn noop1(_this: *mut c_void, _a: u32) {}
-extern "C" fn noop2(_this: *mut c_void, _a: u32, _b: u32) {}
-extern "C" fn noop3(_this: *mut c_void, _a: u32, _b: u32, _c: i32) {}
+// ---------------------------------------------------------------------------
+// ID3D11DeviceContext methods (triangle path)
+// ---------------------------------------------------------------------------
+
+/// `ID3D11DeviceContext::VSSetShader(pVertexShader, ppClassInstances, ...)`.
+/// Extracts the native `Shader` from the COM object and binds it on the
+/// context. The class-instance arguments are ignored (M7b has none).
+extern "C" fn context_vs_set_shader(
+    this: *mut c_void,
+    p_vertex_shader: *mut c_void,
+    _pp_class_instances: *const *mut c_void,
+    _num_class_instances: u32,
+) {
+    if p_vertex_shader.is_null() {
+        return;
+    }
+    // SAFETY: `p_vertex_shader` is a live vertex-shader COM object; `this` is a
+    // live context COM object.
+    unsafe {
+        let shader = inner::<ShaderInner>(p_vertex_shader);
+        let ctx = inner_mut::<ContextInner>(this);
+        ctx.ctx.vs_set_shader(&shader.shader);
+    }
+}
+
+/// `ID3D11DeviceContext::PSSetShader` — the pixel-stage twin of
+/// [`context_vs_set_shader`].
+extern "C" fn context_ps_set_shader(
+    this: *mut c_void,
+    p_pixel_shader: *mut c_void,
+    _pp_class_instances: *const *mut c_void,
+    _num_class_instances: u32,
+) {
+    if p_pixel_shader.is_null() {
+        return;
+    }
+    // SAFETY: `p_pixel_shader` is a live pixel-shader COM object; `this` is a
+    // live context COM object.
+    unsafe {
+        let shader = inner::<ShaderInner>(p_pixel_shader);
+        let ctx = inner_mut::<ContextInner>(this);
+        ctx.ctx.ps_set_shader(&shader.shader);
+    }
+}
+
+/// `ID3D11DeviceContext::IASetVertexBuffers(StartSlot, NumBuffers,
+/// ppVertexBuffers, pStrides, pOffsets)`. Binds the first vertex buffer (slot
+/// 0) to the native context. Only slot 0 is honoured by the native pipeline;
+/// additional buffers are accepted and ignored.
+extern "C" fn context_ia_set_vertex_buffers(
+    this: *mut c_void,
+    _start_slot: u32,
+    num_buffers: u32,
+    pp_vertex_buffers: *const *mut c_void,
+    _p_strides: *const u64,
+    p_offsets: *const u32,
+) {
+    if num_buffers == 0 || pp_vertex_buffers.is_null() {
+        return;
+    }
+    // SAFETY: `pp_vertex_buffers` points to `num_buffers` interface pointers.
+    let vb_ptr = unsafe { *pp_vertex_buffers };
+    if vb_ptr.is_null() {
+        return;
+    }
+    let offset = if p_offsets.is_null() {
+        0
+    } else {
+        // SAFETY: `p_offsets` points to `num_buffers` u32 offsets per the contract.
+        unsafe { *p_offsets as u64 }
+    };
+    // SAFETY: `vb_ptr` is a live buffer COM object; `this` is a live context.
+    unsafe {
+        let buf = inner::<BufferInner>(vb_ptr);
+        let ctx = inner_mut::<ContextInner>(this);
+        ctx.ctx.ia_set_vertex_buffers(&buf.buffer, offset);
+    }
+}
+
+/// `ID3D11DeviceContext::IASetInputLayout(pInputLayout)`. The native pipeline
+/// hardcodes the `float2 POSITION` binding, so the layout is accepted but not
+/// consumed; storing it would require a context-side field the native API does
+/// not expose yet.
+extern "C" fn context_ia_set_input_layout(_this: *mut c_void, _p_input_layout: *mut c_void) {
+    // Accepted; the native pipeline builds the vertex input from the bound
+    // vertex buffer's stride (hardcoded 2*f32) at pipeline-creation time.
+}
+
+/// `ID3D11DeviceContext::IASetPrimitiveTopology(Topology)`. Maps the D3D11
+/// topology to the native pipeline (which hardcodes `TRIANGLE_LIST`); only
+/// `D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST` (4) is honoured.
+extern "C" fn context_ia_set_primitive_topology(_this: *mut c_void, topology: u32) {
+    map_topology(topology);
+}
+
+/// `ID3D11DeviceContext::Draw(VertexCount, StartVertexLocation)`. Delegates to
+/// the native `DeviceContext::draw` with default rasterizer state (the
+/// triangle sample sets no custom rasterizer state).
+extern "C" fn context_draw(this: *mut c_void, vertex_count: u32, start_vertex: u32) {
+    let _ = start_vertex;
+    // SAFETY: `this` is a live context COM object.
+    let ctx = unsafe { inner_mut::<ContextInner>(this) };
+    if let Err(e) = ctx
+        .ctx
+        .draw(vertex_count, nigg_d3d11::RasterizerDesc::default())
+    {
+        log::warn!("d3d11-com: Draw failed: {e}");
+    }
+}
+
+/// `ID3D11DeviceContext::DrawIndexed(IndexCount, StartIndex, VertexOffset)`.
+/// Delegates to the native `DeviceContext::draw_indexed`.
+extern "C" fn context_draw_indexed(
+    this: *mut c_void,
+    index_count: u32,
+    start_index: u32,
+    vertex_offset: i32,
+) {
+    let _ = start_index;
+    // SAFETY: `this` is a live context COM object.
+    let ctx = unsafe { inner_mut::<ContextInner>(this) };
+    if let Err(e) = ctx.ctx.draw_indexed(
+        index_count,
+        vertex_offset,
+        nigg_d3d11::RasterizerDesc::default(),
+    ) {
+        log::warn!("d3d11-com: DrawIndexed failed: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// No-op stubs for the remaining context setters the triangle sample does not
+// call. These are `void` in D3D11; a no-op keeps callers happy. Plain safe fns.
+// ---------------------------------------------------------------------------
+
+/// `*SetConstantBuffers` / `*SetShaderResources` / `*SetSamplers` — the
+/// triangle sample binds no constant buffers, shader resources, or samplers,
+/// so these are accepted and ignored.
 extern "C" fn noop_set_ptrs(_this: *mut c_void, _a: u32, _b: u32, _c: *const *mut c_void) {}
-extern "C" fn noop_set_shader(
-    _this: *mut c_void,
-    _a: *mut c_void,
-    _b: *const *mut c_void,
-    _c: u32,
-) {
-}
-extern "C" fn noop_ia_vertex_buffers(
-    _this: *mut c_void,
-    _a: u32,
-    _b: u32,
-    _c: *const *mut c_void,
-    _d: *const u64,
-    _e: *const u32,
-) {
-}
+
+/// `IASetIndexBuffer` — the triangle draws non-indexed (`Draw(3, 0)`), so the
+/// index buffer setter is accepted and ignored.
 extern "C" fn noop_ia_index_buffer(_this: *mut c_void, _a: *mut c_void, _b: u32, _c: u32) {}
-extern "C" fn noop_ia_input_layout(_this: *mut c_void, _a: *mut c_void) {}
+
+/// `UpdateSubresource(pDst, DstSubresource, pDstBox, pSrcData, SrcRowPitch,
+/// SrcDepthPitch)` — uploads data to a constant buffer. The triangle sample
+/// uses no constant buffers, so this is accepted and ignored.
 extern "C" fn noop_update(
     _this: *mut c_void,
     _a: *mut c_void,
@@ -494,6 +1019,8 @@ extern "C" fn noop_update(
     _f: u32,
 ) {
 }
+
+/// `Map` — returns `E_NOTIMPL` (the triangle uses no dynamic resources).
 extern "C" fn noop_map(
     _this: *mut c_void,
     _a: *mut c_void,
@@ -504,6 +1031,9 @@ extern "C" fn noop_map(
 ) -> i32 {
     E_NOTIMPL
 }
+
+/// `Unmap` — a void no-op (the triangle uses no dynamic resources).
+extern "C" fn noop_unmap(_this: *mut c_void, _a: *mut c_void, _b: u32) {}
 
 extern "C" fn factory_enum_adapters(_this: *mut c_void, _index: u32, _pp: *mut *mut c_void) -> i32 {
     E_NOTIMPL
@@ -536,6 +1066,8 @@ pub struct ComVtables {
     pub buffer: *const Id3d11BufferVtbl,
     pub vertex_shader: *const Id3d11VertexShaderVtbl,
     pub pixel_shader: *const Id3d11PixelShaderVtbl,
+    pub input_layout: *const Id3d11InputLayoutVtbl,
+    pub state: *const Id3d11StateVtbl,
 }
 
 // SAFETY: `ComVtables` holds only raw addresses of leaked vtable structs and
@@ -583,15 +1115,15 @@ impl ComVtables {
             release: rl,
             create_texture_2d: mk(stub_create4 as *const c_void, 4),
             create_render_target_view: mk(device_create_render_target_view as *const c_void, 4),
-            create_vertex_shader: mk(stub_create_shader as *const c_void, 5),
-            create_pixel_shader: mk(stub_create_shader as *const c_void, 5),
-            create_buffer: mk(stub_create4 as *const c_void, 4),
-            create_input_layout: mk(stub_create_input_layout as *const c_void, 5),
-            create_rasterizer_state: mk(stub_create_state as *const c_void, 3),
-            create_blend_state: mk(stub_create_state as *const c_void, 3),
-            create_depth_stencil_state: mk(stub_create_state as *const c_void, 3),
-            create_depth_stencil_view: mk(stub_create_dsv as *const c_void, 4),
-            create_sampler_state: mk(stub_create_state as *const c_void, 3),
+            create_vertex_shader: mk(device_create_vertex_shader as *const c_void, 5),
+            create_pixel_shader: mk(device_create_pixel_shader as *const c_void, 5),
+            create_buffer: mk(device_create_buffer as *const c_void, 4),
+            create_input_layout: mk(device_create_input_layout as *const c_void, 6),
+            create_rasterizer_state: mk(device_create_rasterizer_state as *const c_void, 3),
+            create_blend_state: mk(device_create_blend_state as *const c_void, 3),
+            create_depth_stencil_state: mk(device_create_depth_stencil_state as *const c_void, 3),
+            create_depth_stencil_view: mk(device_create_depth_stencil_view as *const c_void, 4),
+            create_sampler_state: mk(device_create_sampler_state as *const c_void, 3),
             get_immediate_context: mk(device_get_immediate_context as *const c_void, 2),
         })) as *const Id3d11DeviceVtbl;
 
@@ -601,23 +1133,23 @@ impl ComVtables {
             release: rl,
             om_set_render_targets: mk(context_om_set_render_targets as *const c_void, 4),
             clear_render_target_view: mk(context_clear_render_target_view as *const c_void, 3),
-            vs_set_shader: mk(noop_set_shader as *const c_void, 4),
-            ps_set_shader: mk(noop_set_shader as *const c_void, 4),
+            vs_set_shader: mk(context_vs_set_shader as *const c_void, 4),
+            ps_set_shader: mk(context_ps_set_shader as *const c_void, 4),
             vs_set_constant_buffers: mk(noop_set_ptrs as *const c_void, 4),
             ps_set_constant_buffers: mk(noop_set_ptrs as *const c_void, 4),
             vs_set_shader_resources: mk(noop_set_ptrs as *const c_void, 4),
             ps_set_shader_resources: mk(noop_set_ptrs as *const c_void, 4),
             vs_set_samplers: mk(noop_set_ptrs as *const c_void, 4),
             ps_set_samplers: mk(noop_set_ptrs as *const c_void, 4),
-            ia_set_vertex_buffers: mk(noop_ia_vertex_buffers as *const c_void, 5),
+            ia_set_vertex_buffers: mk(context_ia_set_vertex_buffers as *const c_void, 6),
             ia_set_index_buffer: mk(noop_ia_index_buffer as *const c_void, 4),
-            ia_set_input_layout: mk(noop_ia_input_layout as *const c_void, 2),
-            ia_set_primitive_topology: mk(noop1 as *const c_void, 2),
+            ia_set_input_layout: mk(context_ia_set_input_layout as *const c_void, 2),
+            ia_set_primitive_topology: mk(context_ia_set_primitive_topology as *const c_void, 2),
             update_subresource: mk(noop_update as *const c_void, 7),
-            draw: mk(noop2 as *const c_void, 3),
-            draw_indexed: mk(noop3 as *const c_void, 4),
+            draw: mk(context_draw as *const c_void, 3),
+            draw_indexed: mk(context_draw_indexed as *const c_void, 4),
             map: mk(noop_map as *const c_void, 6),
-            unmap: mk(noop2 as *const c_void, 3),
+            unmap: mk(noop_unmap as *const c_void, 3),
             flush: mk(context_flush as *const c_void, 1),
         })) as *const Id3d11DeviceContextVtbl;
 
@@ -646,6 +1178,16 @@ impl ComVtables {
             add_ref: ar,
             release: rl,
         })) as *const Id3d11PixelShaderVtbl;
+        let input_layout = Box::into_raw(Box::new(Id3d11InputLayoutVtbl {
+            query_interface: qi,
+            add_ref: ar,
+            release: rl,
+        })) as *const Id3d11InputLayoutVtbl;
+        let state = Box::into_raw(Box::new(Id3d11StateVtbl {
+            query_interface: qi,
+            add_ref: ar,
+            release: rl,
+        })) as *const Id3d11StateVtbl;
 
         ComVtables {
             factory,
@@ -657,6 +1199,8 @@ impl ComVtables {
             buffer,
             vertex_shader,
             pixel_shader,
+            input_layout,
+            state,
         }
     }
 }

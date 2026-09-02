@@ -66,9 +66,9 @@ use std::sync::OnceLock;
 use std::os::raw::c_void;
 
 pub use methods::{
-    ComVtables, Id3d11BufferVtbl, Id3d11DeviceContextVtbl, Id3d11DeviceVtbl, Id3d11PixelShaderVtbl,
-    Id3d11RenderTargetViewVtbl, Id3d11Texture2dVtbl, Id3d11VertexShaderVtbl, IdxgiFactoryVtbl,
-    IdxgiSwapChainVtbl,
+    ComVtables, Id3d11BufferVtbl, Id3d11DeviceContextVtbl, Id3d11DeviceVtbl, Id3d11InputLayoutVtbl,
+    Id3d11PixelShaderVtbl, Id3d11RenderTargetViewVtbl, Id3d11StateVtbl, Id3d11Texture2dVtbl,
+    Id3d11VertexShaderVtbl, IdxgiFactoryVtbl, IdxgiSwapChainVtbl,
 };
 
 // ---------------------------------------------------------------------------

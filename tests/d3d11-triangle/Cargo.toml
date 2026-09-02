@@ -1,0 +1,39 @@
+[package]
+name = "nigg-d3d11-triangle"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# M7b D3D11 triangle sample PE. A `#![no_std]`/`#![no_main]` Windows program that
+# imports only `d3d11.dll`/`dxgi.dll`/`kernel32.dll` (via raw-dylib + a custom
+# entry point, no CRT), so the whole import surface fits the PE loader's COM
+# thunk layer. It creates a device + swap chain, compiles HLSL VS/PS (the SPIR-V
+# is generated at build time by `build.rs` via `nigg-hlsl-compiler` and embedded
+# with `include_bytes!`), creates a vertex buffer + input layout, draws a
+# green triangle, presents, and exits 0. `panic = "abort"` is required because
+# a no_std core cannot unwind and the panic handler loops anyway. This is a
+# standalone workspace (not a member of the parent workspace) so its own
+# profiles apply. Build (cross-compile):
+#   cargo build --target x86_64-pc-windows-gnu --manifest-path tests/d3d11-triangle/Cargo.toml
+
+[[bin]]
+name = "d3d11_triangle"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+# The build script compiles HLSL -> SPIR-V at build time using the workspace's
+# own compiler crate. It is a normal (std) host build script, so it can pull in
+# the compiler; the resulting SPIR-V bytes are embedded into the no_std PE via
+# `include_bytes!`.
+[build-dependencies]
+nigg-hlsl-compiler = { path = "../../crates/hlsl-compiler" }
+
+# Standalone workspace so the parent workspace's profiles do not override
+# `panic = "abort"` (workspace members inherit the root's profiles).
+[workspace]
