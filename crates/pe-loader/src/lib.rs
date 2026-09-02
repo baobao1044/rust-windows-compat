@@ -21,10 +21,12 @@
 mod imports;
 mod mapping;
 mod teb;
+mod thunk;
 
 use imports::{ImplTable, ResolvedImports};
 use mapping::{MapError, MappedImage};
 use teb::TebPeb;
+use thunk::ThunkArena;
 
 use std::path::Path;
 
@@ -52,6 +54,9 @@ pub struct PeImage {
     _teb_peb: Box<TebPeb>,
     /// The stack allocated for the guest thread. Kept alive alongside the image.
     _stack: nigg_runtime::Stack,
+    /// The executable thunk arena holding the Win64->SysV trampolines the IAT points at.
+    /// Kept alive for the lifetime of `PeImage` so the trampoline code stays mapped.
+    _thunk_arena: ThunkArena,
 }
 
 impl PeImage {
@@ -71,10 +76,19 @@ impl PeImage {
         nigg_runtime::set_thread_gs_base(self._teb_peb.teb_ptr())
             .map_err(|e| LoadError::Bootstrap(e.to_string()))?;
 
+        // Call the entrypoint with the Windows x64 ABI: RCX = PEB pointer, RDX = 0, with a
+        // 32-byte shadow space on the guest stack. The entrypoint reads the PEB via
+        // `gs:[0x60]` (which we set to point at the PEB) and via the RCX argument. The
+        // minimal fixture ignores arguments entirely, so it keeps returning 42 under this
+        // convention.
+        //
         // SAFETY: `entry` is the resolved, relocated, executable entrypoint; `stack.top()`
-        // is a valid, 16-byte-aligned, writable stack pointer with space below it. Both are
-        // held alive by `self` for the duration of the call.
-        let code = unsafe { nigg_runtime::run_entrypoint(entry, self._stack.top()) };
+        // is a valid, 16-byte-aligned, writable stack pointer with space below it; `peb`
+        // is the live PEB pointer kept alive by `self._teb_peb`. All three are held alive
+        // by `self` for the duration of the call.
+        let code = unsafe {
+            nigg_runtime::run_entrypoint_win64(entry, self._stack.top(), self._teb_peb.peb_ptr())
+        };
         Ok(code)
     }
 
@@ -119,10 +133,20 @@ pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
         mapping::apply_relocations(&mapped, bytes, *reloc_dir)?;
     }
 
-    // Resolve imports and write the IAT.
-    let table = ImplTable::default_table();
+    // Resolve imports and write the IAT. We build ABI-correct Win64->SysV trampolines in
+    // an executable arena; the IAT slots point at these trampolines so PE code calling
+    // `call [IAT slot]` (Windows x64 ABI) lands in the trampoline, which shuffles the
+    // registers to the System V layout and calls the Rust implementation.
+    let mut thunk_arena = ThunkArena::with_capacity(32 * 1024)
+        .map_err(|e| LoadError::Bootstrap(format!("thunk arena alloc: {e}")))?;
+    let table = ImplTable::build(&mut thunk_arena);
     let resolved = imports::resolve(&pe.imports, &table);
     mapping::write_iat(&mapped, &pe.imports, &resolved.resolved);
+    // Flip the thunk arena from read/write to read/execute (W^X) before any trampoline is
+    // called by the guest.
+    thunk_arena
+        .finalize()
+        .map_err(|e| LoadError::Bootstrap(format!("thunk arena seal: {e}")))?;
 
     // Build the TEB/PEB. Use the guest stack's bounds for the TIB StackBase/StackLimit so
     // `gs:[0x08]`/`gs:[0x10]` describe the same stack we'll run on.
@@ -142,6 +166,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
         imports: resolved,
         _teb_peb: teb_peb,
         _stack: stack,
+        _thunk_arena: thunk_arena,
     })
 }
 

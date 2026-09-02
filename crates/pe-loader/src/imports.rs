@@ -1,28 +1,23 @@
 //! Import directory resolution for the PE loader.
 //!
 //! Each imported symbol is resolved to a native function pointer that the loader writes
-//! into the Import Address Table (IAT). For Phase 1 we implement a small set of
-//! `kernel32`/`ntdll`/`vcruntime` exports by hand, backed by Linux syscalls via `libc`;
-//! unknown imports are replaced with a logging trap stub that logs once and aborts
-//! gracefully, so a missing import fails loudly rather than silently calling junk.
+//! into the Import Address Table (IAT). The implementations live in `nigg-ntapi` (memory,
+//! sync, threads, time, process) and a few trivial intrinsics (`memset`/`memcpy`/`memmove`)
+//! are kept locally. **Critically**, the pointers stored in the IAT are not the raw
+//! `extern "C"` (System V) implementations: they are Win64->SysV **ABI trampolines**
+//! allocated in a [`crate::thunk::ThunkArena`]. When PE code does `call [IAT slot]` the call
+//! arrives in the Windows x64 ABI (args in RCX/RDX/R8/R9 + 32-byte shadow space); the
+//! trampoline shuffles the registers to the System V layout (RDI/RSI/RDX/RCX/R8/R9) and
+//! tail-calls the Rust implementation. Without this, real PEs would receive their
+//! arguments in the wrong registers — the #1 blocker for running real PE binaries.
 //!
-//! The hand-written thunks use the Windows x64 calling convention
-//! (`extern "C"` is System V on Linux, so the thunks translate the ABI) — but for Phase 1
-//! the implemented exports are trivial enough (return a constant, call `exit`, write to
-//! stderr) that the ABI difference does not matter: the exports we implement take their
-//! arguments in the registers that overlap, or take none, and return `i32`/`u32` in
-//! `eax`/`rax` which is identical between the two conventions. Real ABI translation is a
-//! later milestone.
+//! Unknown imports get a logging trap stub that aborts gracefully, so a missing import
+//! fails loudly rather than silently calling junk.
 
 use std::collections::HashMap;
-use std::os::raw::{c_int, c_uint, c_void};
+use std::os::raw::c_void;
 
-/// Standard Windows handle value for `STD_OUTPUT_HANDLE`.
-const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5;
-/// Standard Windows handle value for `STD_ERROR_HANDLE`.
-const STD_ERROR_HANDLE: u32 = 0xFFFFFFF5 + 1;
-/// Standard Windows handle value for `STD_INPUT_HANDLE`.
-const STD_INPUT_HANDLE: u32 = 0xFFFFFFF5 + 2;
+use crate::thunk::ThunkArena;
 
 /// A resolved import: the native address to write into the IAT slot.
 pub type FnPtr = *const c_void;
@@ -39,9 +34,9 @@ pub struct ResolvedImports {
 
 /// Resolve `imports` (from goblin) into native function pointers.
 ///
-/// `known` is the table of implemented exports; `imports` is goblin's parsed import list.
-/// Returns the address to store in each IAT slot along with a record of what was resolved
-/// vs. stubbed.
+/// `known` is the table of implemented exports (populated with ABI-correct thunk pointers);
+/// `imports` is goblin's parsed import list. Returns the address to store in each IAT slot
+/// along with a record of what was resolved vs. stubbed.
 pub fn resolve(imports: &[goblin::pe::import::Import], known: &ImplTable) -> ResolvedImports {
     let mut out = ResolvedImports::default();
     for imp in imports {
@@ -51,7 +46,7 @@ pub fn resolve(imports: &[goblin::pe::import::Import], known: &ImplTable) -> Res
             out.resolved.insert((dll.clone(), sym.clone()), ptr);
         } else {
             log::warn!(
-                "stubbed import: {}!{} (no Phase 1 implementation)",
+                "stubbed import: {}!{} (no M1 implementation)",
                 imp.dll,
                 imp.name
             );
@@ -86,113 +81,17 @@ fn normalize_symbol(name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Hand-written export implementations (backed by Linux syscalls via libc).
+// Trivial C-runtime intrinsics (kept local; not worth an ntapi round-trip).
 // ---------------------------------------------------------------------------
 
-/// `kernel32!ExitProcess(u32 exit_code) -> !`. Terminates the process with `exit_code`.
-extern "C" fn kernel32_exit_process(exit_code: u32) -> ! {
-    log::trace!("kernel32!ExitProcess({exit_code})");
-    std::process::exit(exit_code as i32);
-}
-
-/// `kernel32!GetStdHandle(u32 std_handle) -> *mut c_void`. Maps a STD_* handle pseudo-value
-/// to the corresponding Linux fd as a "handle".
-extern "C" fn kernel32_get_std_handle(std_handle: u32) -> *mut c_void {
-    log::trace!("kernel32!GetStdHandle({std_handle:#x})");
-    let fd = match std_handle {
-        STD_INPUT_HANDLE => 0,
-        STD_OUTPUT_HANDLE => 1,
-        STD_ERROR_HANDLE => 2,
-        _ => -1i32 as *mut c_void as i32, // INVALID_HANDLE_VALUE-equivalent
-    };
-    // Return the fd as a tagged handle (we never dereference these as pointers; they're
-    // opaque ids in Phase 1).
-    fd as usize as *mut c_void
-}
-
-/// `kernel32!WriteFile(handle, buf, len, written, overlapped) -> u32 (BOOL)`.
-///
-/// For Phase 1 this ignores the overlapped parameter and writes synchronously to the fd
-/// encoded in the handle, returning 1 (TRUE) on success.
-extern "C" fn kernel32_write_file(
-    handle: *mut c_void,
-    buf: *const u8,
-    len: u32,
-    written: *mut u32,
-    _overlapped: *mut c_void,
-) -> u32 {
-    let fd = handle as usize as i32;
-    if fd < 0 || buf.is_null() {
-        return 0; // FALSE
-    }
-    // SAFETY: the guest passes a buffer valid for `len` bytes (Windows contract). We read
-    // exactly `len` bytes from it via `write(2)`.
-    let n = unsafe { libc::write(fd, buf as *const c_void, len as usize) };
-    if n < 0 {
-        return 0; // FALSE
-    }
-    if !written.is_null() {
-        // SAFETY: `written` is an out-pointer provided by the guest, valid for one u32.
-        unsafe { std::ptr::write_unaligned(written, n as u32) };
-    }
-    1 // TRUE
-}
-
-/// `kernel32!GetLastError() -> u32`. Phase 1 has no error state; always returns 0.
-extern "C" fn kernel32_get_last_error() -> u32 {
-    log::trace!("kernel32!GetLastError() -> 0");
-    0
-}
-
-/// `kernel32!SetLastError(u32) -> void`. No-op in Phase 1.
-extern "C" fn kernel32_set_last_error(_code: u32) {
-    log::trace!("kernel32!SetLastError({_code}) [no-op]");
-}
-
-/// `kernel32!GetTickCount() -> u32`. Milliseconds since boot, via `clock_gettime(MONOTONIC)`.
-extern "C" fn kernel32_get_tick_count() -> u32 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` with `CLOCK_MONOTONIC` writes a valid timespec into the
-    // caller-provided struct and never fails on a supported clock.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let ms = (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000;
-    (ms & 0xFFFF_FFFF) as u32
-}
-
-/// `kernel32!QueryPerformanceCounter(LARGE_INTEGER*) -> BOOL`.
-extern "C" fn kernel32_query_performance_counter(out: *mut i64) -> u32 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime(CLOCK_MONOTONIC)` writes a valid timespec; never fails here.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let ns = ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
-    if !out.is_null() {
-        // SAFETY: `out` is a guest-provided out-pointer valid for one i64.
-        unsafe { std::ptr::write_unaligned(out, ns) };
-    }
-    1 // TRUE
-}
-
-/// `ntdll!NtTerminateProcess(handle, status) -> !`. `handle` 0 means current process.
-extern "C" fn ntdll_terminate_process(_handle: *mut c_void, status: i32) -> ! {
-    log::trace!("ntdll!NtTerminateProcess({:#x})", status);
-    std::process::exit(status);
-}
-
-/// `vcruntime!memset(dst, val, n) -> *mut c_void`. A real `memset` (often imported by
-/// MSVC-built code and safe to implement directly).
+/// `vcruntime!memset(dst, val, n) -> dst*`. A real `memset`.
 extern "C" fn vcruntime_memset(dst: *mut u8, val: u8, n: usize) -> *mut u8 {
     // SAFETY: `dst..dst+n` is valid for writing per the C `memset` contract.
     unsafe { std::ptr::write_bytes(dst, val, n) };
     dst
 }
 
-/// `vcruntime!memcpy(dst, src, n) -> *mut c_void`.
+/// `vcruntime!memcpy(dst, src, n) -> dst*`.
 extern "C" fn vcruntime_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     // SAFETY: `dst..dst+n` and `src..src+n` are valid and non-overlapping per the C
     // `memcpy` contract.
@@ -200,98 +99,76 @@ extern "C" fn vcruntime_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u
     dst
 }
 
-/// Table of implemented Windows exports, keyed by `(lowercased dll, symbol)`.
+/// `vcruntime!memmove(dst, src, n) -> dst*`. Handles overlapping ranges.
+extern "C" fn vcruntime_memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: `dst..dst+n` and `src..src+n` are valid (may overlap) per the C `memmove`
+    // contract; `copy` handles overlap correctly.
+    unsafe { std::ptr::copy(src, dst, n) };
+    dst
+}
+
+// ---------------------------------------------------------------------------
+// Argument-count metadata for each implemented import, used to size the trampoline.
+// ---------------------------------------------------------------------------
+
+/// The number of integer/pointer arguments a given implementation takes, so the thunk can
+/// shuffle the right number of registers. Functions returning `-> !` use the noreturn path.
+struct ImportSpec {
+    dll: &'static str,
+    sym: &'static str,
+    /// The System V `extern "C"` implementation address.
+    target: FnPtr,
+    /// How many integer/pointer args the implementation takes (0..=8 for returning, 0..=6
+    /// for noreturn).
+    n_args: u8,
+    /// `true` if the function never returns (ExitProcess / NtTerminateProcess).
+    noreturn: bool,
+}
+
+/// Table of implemented Windows exports, keyed by `(lowercased dll, symbol)`. The values
+/// are the addresses to write into the IAT — for the real loader these are ABI-correct
+/// trampoline pointers; for the unit tests they may be direct fn pointers.
 pub struct ImplTable {
     map: HashMap<(String, String), FnPtr>,
 }
 
 impl ImplTable {
-    /// Build the default table of Phase 1 implemented exports.
-    pub fn default_table() -> Self {
+    /// Build the table of M1 implemented exports, wrapping each implementation in a
+    /// Win64->SysV trampoline allocated from `arena`. The arena must be `finalize()`d
+    /// (flipped to PROT_EXEC) before any IAT entry is called.
+    pub fn build(arena: &mut ThunkArena) -> Self {
+        let specs = import_specs();
         let mut map = HashMap::new();
-        let mut add = |dll: &str, sym: &str, f: FnPtr| {
-            map.insert((dll.to_string(), sym.to_string()), f);
-        };
-
-        // kernel32 — console/process/time
-        add(
-            "kernel32.dll",
-            "ExitProcess",
-            kernel32_exit_process as FnPtr,
-        );
-        add(
-            "kernel32.dll",
-            "GetStdHandle",
-            kernel32_get_std_handle as FnPtr,
-        );
-        add("kernel32.dll", "WriteFile", kernel32_write_file as FnPtr);
-        add(
-            "kernel32.dll",
-            "GetLastError",
-            kernel32_get_last_error as FnPtr,
-        );
-        add(
-            "kernel32.dll",
-            "SetLastError",
-            kernel32_set_last_error as FnPtr,
-        );
-        add(
-            "kernel32.dll",
-            "GetTickCount",
-            kernel32_get_tick_count as FnPtr,
-        );
-        add(
-            "kernel32.dll",
-            "QueryPerformanceCounter",
-            kernel32_query_performance_counter as FnPtr,
-        );
-
-        // ntdll — process termination
-        add(
-            "ntdll.dll",
-            "NtTerminateProcess",
-            ntdll_terminate_process as FnPtr,
-        );
-
-        // vcruntime — C runtime intrinsics
-        add("vcruntime140.dll", "memset", vcruntime_memset as FnPtr);
-        add("vcruntime140.dll", "memcpy", vcruntime_memcpy as FnPtr);
-        add("vcruntime140_1.dll", "memset", vcruntime_memset as FnPtr);
-        add("vcruntime140_1.dll", "memcpy", vcruntime_memcpy as FnPtr);
-        add("ucrtbase.dll", "memset", vcruntime_memset as FnPtr);
-        add("ucrtbase.dll", "memcpy", vcruntime_memcpy as FnPtr);
-
-        // api-ms-win-* sets — these are API-set pseudo-DLLs that forward to kernel32;
-        // forward the few we implement so apiset-named imports resolve too.
-        for apiset in [
-            "api-ms-win-core-processthreads-l1-1-0",
-            "api-ms-win-core-console-l1-1-0",
-            "api-ms-win-core-console-l2-1-0",
-            "api-ms-win-core-synch-l1-1-0",
-            "api-ms-win-core-synch-l1-2-0",
-            "api-ms-win-core-errorhandling-l1-1-0",
-            "api-ms-win-core-profile-l1-1-0",
-            "api-ms-win-core-libraryloader-l1-1-0",
-        ] {
-            add(apiset, "ExitProcess", kernel32_exit_process as FnPtr);
-            add(apiset, "GetStdHandle", kernel32_get_std_handle as FnPtr);
-            add(apiset, "WriteFile", kernel32_write_file as FnPtr);
-            add(apiset, "GetLastError", kernel32_get_last_error as FnPtr);
-            add(apiset, "SetLastError", kernel32_set_last_error as FnPtr);
-            add(apiset, "GetTickCount", kernel32_get_tick_count as FnPtr);
-            add(
-                apiset,
-                "QueryPerformanceCounter",
-                kernel32_query_performance_counter as FnPtr,
-            );
-            add(
-                apiset,
-                "NtTerminateProcess",
-                ntdll_terminate_process as FnPtr,
-            );
+        for spec in specs {
+            let ptr = if spec.noreturn {
+                arena
+                    .make_thunk_noreturn(spec.target, spec.n_args)
+                    .unwrap_or_else(|e| panic!("thunk for {}!{} failed: {e}", spec.dll, spec.sym))
+            } else {
+                arena
+                    .make_thunk(spec.target, spec.n_args)
+                    .unwrap_or_else(|e| panic!("thunk for {}!{} failed: {e}", spec.dll, spec.sym))
+            };
+            map.insert((spec.dll.to_string(), spec.sym.to_string()), ptr);
         }
-
+        // Forward the implemented symbols to the api-ms-win-* pseudo-DLLs too.
+        forward_apisets(&mut map, arena);
         ImplTable { map }
+    }
+
+    /// Build the table with **direct** fn pointers (no trampolines), for unit tests that
+    /// only exercise `lookup` and never execute PE code through the IAT.
+    #[allow(dead_code)] // used by unit tests; the loader uses `build`.
+    pub fn default_table() -> Self {
+        let specs = import_specs();
+        let mut map = HashMap::new();
+        for spec in specs {
+            map.insert((spec.dll.to_string(), spec.sym.to_string()), spec.target);
+        }
+        // Forward to apiset pseudo-DLLs (using the same direct pointers).
+        let mut forward_map = map.clone();
+        forward_apisets_direct(&mut forward_map, &map);
+        ImplTable { map: forward_map }
     }
 
     fn lookup(&self, dll: &str, sym: &str) -> Option<FnPtr> {
@@ -299,10 +176,574 @@ impl ImplTable {
     }
 }
 
-/// Helper to silence an unused-import warning when `c_int`/`c_uint` are only referenced
-/// through the signatures above in some configurations.
-#[allow(dead_code)]
-fn _unused_types(_a: c_int, _b: c_uint) {}
+/// The list of implemented imports with their argument counts. Each `target` is a System V
+/// `extern "C"` function; the trampoline translates the Windows x64 call into a System V
+/// call to it. Most implementations delegate to `nigg_ntapi`; `memset`/`memcpy`/`memmove`
+/// are local.
+fn import_specs() -> Vec<ImportSpec> {
+    use nigg_ntapi as nt;
+
+    vec![
+        // --- kernel32: process / console / time / last-error ---
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "ExitProcess",
+            target: nt::process::exit_process as FnPtr,
+            n_args: 1,
+            noreturn: true,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetStdHandle",
+            target: nt::process::get_std_handle as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "WriteFile",
+            target: nt::process::write_file as FnPtr,
+            n_args: 5,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "ReadFile",
+            target: nt::process::read_file as FnPtr,
+            n_args: 5,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetLastError",
+            target: nt::process::get_last_error as FnPtr,
+            n_args: 0,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "SetLastError",
+            target: nt::process::set_last_error as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetTickCount",
+            target: nt::process::get_tick_count as FnPtr,
+            n_args: 0,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetTickCount64",
+            target: nt::process::get_tick_count_64 as FnPtr,
+            n_args: 0,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "QueryPerformanceCounter",
+            target: nt::process::query_performance_counter as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "QueryPerformanceFrequency",
+            target: nt::process::query_performance_frequency as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "CloseHandle",
+            target: nt::process::close_handle as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        // --- kernel32: memory ---
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "VirtualAlloc",
+            target: nt::memory::virtual_alloc as FnPtr,
+            n_args: 4,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "VirtualFree",
+            target: nt::memory::virtual_free as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "VirtualProtect",
+            target: nt::memory::virtual_protect as FnPtr,
+            n_args: 4,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "VirtualQuery",
+            target: nt::memory::virtual_query as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        // --- kernel32: synchronization ---
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "InitializeCriticalSection",
+            target: nt::sync::initialize_critical_section as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "EnterCriticalSection",
+            target: nt::sync::enter_critical_section as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "LeaveCriticalSection",
+            target: nt::sync::leave_critical_section as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "DeleteCriticalSection",
+            target: nt::sync::delete_critical_section as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "CreateEventW",
+            target: nt::sync::create_event_w as FnPtr,
+            n_args: 4,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "SetEvent",
+            target: nt::sync::set_event as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "ResetEvent",
+            target: nt::sync::reset_event as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "PulseEvent",
+            target: nt::sync::pulse_event as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "CreateMutexW",
+            target: nt::sync::create_mutex_w as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "ReleaseMutex",
+            target: nt::sync::release_mutex as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "CreateSemaphoreW",
+            target: nt::sync::create_semaphore_w as FnPtr,
+            n_args: 4,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "ReleaseSemaphore",
+            target: nt::sync::release_semaphore as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "InitializeSRWLock",
+            target: nt::sync::initialize_srw_lock as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "AcquireSRWLockExclusive",
+            target: nt::sync::acquire_srw_lock_exclusive as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "AcquireSRWLockShared",
+            target: nt::sync::acquire_srw_lock_shared as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "ReleaseSRWLockExclusive",
+            target: nt::sync::release_srw_lock_exclusive as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "ReleaseSRWLockShared",
+            target: nt::sync::release_srw_lock_shared as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "Sleep",
+            target: nt::sync::sleep as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "SleepEx",
+            target: nt::sync::sleep_ex as FnPtr,
+            n_args: 2,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "WaitForSingleObject",
+            target: nt::sync::wait_for_single_object as FnPtr,
+            n_args: 2,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "WaitForMultipleObjects",
+            target: nt::sync::wait_for_multiple_objects as FnPtr,
+            n_args: 4,
+            noreturn: false,
+        },
+        // --- kernel32: threads / TLS ---
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "CreateThread",
+            target: nt::thread::create_thread as FnPtr,
+            n_args: 6,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetCurrentThread",
+            target: nt::thread::get_current_thread as FnPtr,
+            n_args: 0,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetCurrentProcess",
+            target: nt::thread::get_current_process as FnPtr,
+            n_args: 0,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetCurrentThreadId",
+            target: nt::thread::get_current_thread_id as FnPtr,
+            n_args: 0,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetCurrentProcessId",
+            target: nt::thread::get_current_process_id as FnPtr,
+            n_args: 0,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "GetThreadId",
+            target: nt::thread::get_thread_id as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "ResumeThread",
+            target: nt::thread::resume_thread as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "SuspendThread",
+            target: nt::thread::suspend_thread as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "TlsAlloc",
+            target: nt::thread::tls_alloc as FnPtr,
+            n_args: 0,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "TlsFree",
+            target: nt::thread::tls_free as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "TlsGetValue",
+            target: nt::thread::tls_get_value as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "kernel32.dll",
+            sym: "TlsSetValue",
+            target: nt::thread::tls_set_value as FnPtr,
+            n_args: 2,
+            noreturn: false,
+        },
+        // --- ntdll ---
+        ImportSpec {
+            dll: "ntdll.dll",
+            sym: "NtTerminateProcess",
+            target: nt::process::nt_terminate_process as FnPtr,
+            n_args: 2,
+            noreturn: true,
+        },
+        ImportSpec {
+            dll: "ntdll.dll",
+            sym: "NtClose",
+            target: nt::process::nt_close as FnPtr,
+            n_args: 1,
+            noreturn: false,
+        },
+        // --- vcruntime / ucrt intrinsics ---
+        ImportSpec {
+            dll: "vcruntime140.dll",
+            sym: "memset",
+            target: vcruntime_memset as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "vcruntime140.dll",
+            sym: "memcpy",
+            target: vcruntime_memcpy as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "vcruntime140.dll",
+            sym: "memmove",
+            target: vcruntime_memmove as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "vcruntime140_1.dll",
+            sym: "memset",
+            target: vcruntime_memset as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "vcruntime140_1.dll",
+            sym: "memcpy",
+            target: vcruntime_memcpy as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "vcruntime140_1.dll",
+            sym: "memmove",
+            target: vcruntime_memmove as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "ucrtbase.dll",
+            sym: "memset",
+            target: vcruntime_memset as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "ucrtbase.dll",
+            sym: "memcpy",
+            target: vcruntime_memcpy as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "ucrtbase.dll",
+            sym: "memmove",
+            target: vcruntime_memmove as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "msvcrt.dll",
+            sym: "memset",
+            target: vcruntime_memset as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "msvcrt.dll",
+            sym: "memcpy",
+            target: vcruntime_memcpy as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+        ImportSpec {
+            dll: "msvcrt.dll",
+            sym: "memmove",
+            target: vcruntime_memmove as FnPtr,
+            n_args: 3,
+            noreturn: false,
+        },
+    ]
+}
+
+/// The api-ms-win-* pseudo-DLL names we forward implemented symbols to (they are API-set
+/// forwards to kernel32/ntdll). The thunks for these are shared with the canonical
+/// kernel32/ntdll entries to keep the arena small.
+const APISETS: &[&str] = &[
+    "api-ms-win-core-processthreads-l1-1-0",
+    "api-ms-win-core-console-l1-1-0",
+    "api-ms-win-core-console-l2-1-0",
+    "api-ms-win-core-synch-l1-1-0",
+    "api-ms-win-core-synch-l1-2-0",
+    "api-ms-win-core-errorhandling-l1-1-0",
+    "api-ms-win-core-profile-l1-1-0",
+    "api-ms-win-core-libraryloader-l1-1-0",
+    "api-ms-win-core-heap-l1-1-0",
+    "api-ms-win-core-memory-l1-1-0",
+    "api-ms-win-core-file-l1-1-0",
+];
+
+/// The kernel32 symbols forwarded to each apiset (so apiset-named imports resolve too).
+const FORWARD_SYMBOLS: &[&str] = &[
+    "ExitProcess",
+    "GetStdHandle",
+    "WriteFile",
+    "ReadFile",
+    "GetLastError",
+    "SetLastError",
+    "GetTickCount",
+    "GetTickCount64",
+    "QueryPerformanceCounter",
+    "QueryPerformanceFrequency",
+    "CloseHandle",
+    "VirtualAlloc",
+    "VirtualFree",
+    "VirtualProtect",
+    "VirtualQuery",
+    "InitializeCriticalSection",
+    "EnterCriticalSection",
+    "LeaveCriticalSection",
+    "DeleteCriticalSection",
+    "CreateEventW",
+    "SetEvent",
+    "ResetEvent",
+    "PulseEvent",
+    "CreateMutexW",
+    "ReleaseMutex",
+    "CreateSemaphoreW",
+    "ReleaseSemaphore",
+    "InitializeSRWLock",
+    "AcquireSRWLockExclusive",
+    "AcquireSRWLockShared",
+    "ReleaseSRWLockExclusive",
+    "ReleaseSRWLockShared",
+    "Sleep",
+    "SleepEx",
+    "WaitForSingleObject",
+    "WaitForMultipleObjects",
+    "CreateThread",
+    "GetCurrentThread",
+    "GetCurrentProcess",
+    "GetCurrentThreadId",
+    "GetCurrentProcessId",
+    "GetThreadId",
+    "ResumeThread",
+    "SuspendThread",
+    "TlsAlloc",
+    "TlsFree",
+    "TlsGetValue",
+    "TlsSetValue",
+];
+
+/// Forward `FORWARD_SYMBOLS` from kernel32 to each apiset, allocating shared thunks (one
+/// per (apiset, symbol)) in `arena`.
+fn forward_apisets(map: &mut HashMap<(String, String), FnPtr>, arena: &mut ThunkArena) {
+    for apiset in APISETS {
+        for sym in FORWARD_SYMBOLS {
+            if let Some(&target) = map.get(&("kernel32.dll".to_string(), (*sym).to_string())) {
+                // `target` is already a thunk pointer; reuse it directly (no new thunk
+                // needed — the trampoline is the same code regardless of which DLL names it).
+                map.insert(((*apiset).to_string(), (*sym).to_string()), target);
+            }
+        }
+    }
+    // Also forward NtTerminateProcess / NtClose from ntdll to apiset synch/errorhandling.
+    for apiset in APISETS {
+        if let Some(&t) = map.get(&("ntdll.dll".to_string(), "NtTerminateProcess".to_string())) {
+            map.insert(((*apiset).to_string(), "NtTerminateProcess".to_string()), t);
+        }
+        if let Some(&t) = map.get(&("ntdll.dll".to_string(), "NtClose".to_string())) {
+            map.insert(((*apiset).to_string(), "NtClose".to_string()), t);
+        }
+    }
+    // Silence the unused-arena warning when forwarding reuses existing pointers.
+    let _ = arena;
+}
+
+/// Forward `FORWARD_SYMBOLS` from kernel32 to each apiset using direct fn pointers (for the
+/// `default_table` path used by unit tests). `source` is the canonical kernel32 map.
+#[allow(dead_code)] // used only by the test-only `default_table` path
+fn forward_apisets_direct(
+    map: &mut HashMap<(String, String), FnPtr>,
+    source: &HashMap<(String, String), FnPtr>,
+) {
+    for apiset in APISETS {
+        for sym in FORWARD_SYMBOLS {
+            if let Some(&target) = source.get(&("kernel32.dll".to_string(), (*sym).to_string())) {
+                map.insert(((*apiset).to_string(), (*sym).to_string()), target);
+            }
+        }
+    }
+    for apiset in APISETS {
+        if let Some(&t) = source.get(&("ntdll.dll".to_string(), "NtTerminateProcess".to_string())) {
+            map.insert(((*apiset).to_string(), "NtTerminateProcess".to_string()), t);
+        }
+        if let Some(&t) = source.get(&("ntdll.dll".to_string(), "NtClose".to_string())) {
+            map.insert(((*apiset).to_string(), "NtClose".to_string()), t);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -313,10 +754,43 @@ mod tests {
         let t = ImplTable::default_table();
         assert!(t.lookup("kernel32.dll", "ExitProcess").is_some());
         assert!(t.lookup("kernel32.dll", "GetStdHandle").is_some());
+        assert!(t.lookup("kernel32.dll", "VirtualAlloc").is_some());
+        assert!(t.lookup("kernel32.dll", "CreateEventW").is_some());
         assert!(t.lookup("ntdll.dll", "NtTerminateProcess").is_some());
         assert!(t.lookup("vcruntime140.dll", "memset").is_some());
         // Unknown symbol resolves to None (the loader will stub it).
         assert!(t.lookup("kernel32.dll", "DefinitelyNotReal").is_none());
+    }
+
+    #[test]
+    fn default_table_forwards_apiset_symbols() {
+        let t = ImplTable::default_table();
+        assert!(
+            t.lookup("api-ms-win-core-synch-l1-1-0", "CreateEventW")
+                .is_some(),
+            "apiset forwards resolve to the same impl"
+        );
+        assert!(t
+            .lookup("api-ms-win-core-memory-l1-1-0", "VirtualAlloc")
+            .is_some());
+    }
+
+    #[test]
+    fn build_table_produces_distinct_thunk_pointers() {
+        // The real-loader path must allocate thunks (distinct from the raw fn ptrs).
+        let mut arena = ThunkArena::new().expect("arena");
+        let t = ImplTable::build(&mut arena);
+        let p = t
+            .lookup("kernel32.dll", "ExitProcess")
+            .expect("ExitProcess resolved");
+        // The thunk must differ from the raw ntapi fn pointer (it is trampoline code).
+        let raw = nigg_ntapi::process::exit_process as FnPtr;
+        assert_ne!(p, raw, "build() wraps impls in trampolines");
+        // memset thunk should also differ from the raw local fn.
+        let pm = t
+            .lookup("vcruntime140.dll", "memset")
+            .expect("memset resolved");
+        assert_ne!(pm, vcruntime_memset as FnPtr);
     }
 
     #[test]

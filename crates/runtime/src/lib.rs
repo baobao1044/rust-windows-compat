@@ -235,6 +235,77 @@ pub unsafe fn run_entrypoint(entry: *const (), stack_top: *mut u8) -> i32 {
     result
 }
 
+/// Call the PE `entry` on `stack_top` using the **Windows x64 calling convention** for the
+/// entrypoint, returning the value left in `eax` (the exit code).
+///
+/// Real Windows PE entrypoints expect to be called per the Windows x64 ABI: the caller must
+/// reserve a 32-byte "shadow space" on the stack (above the return address) that the callee
+/// may use to spill the first four register arguments, and `RSP` must be 16-byte aligned at
+/// the `call` instruction. We place the first argument in `RCX` and the second in `RDX`:
+///
+/// - `RCX = peb`  — the PEB pointer (read by `mainCRTStartup`-style entries via `gs:[0x60]`,
+///   and a harmless non-null value for entries that ignore it).
+/// - `RDX = 0`    — the second parameter, unused for EXE CRT startup (it would be the
+///   `DllMain` reason for a DLL; we pass 0).
+///
+/// This is the simple convention the task brief asks for; richer entrypoint signatures
+/// (`main(argc, argv, envp)` in RCX/RDX/R8) are a later refinement. The minimal fixture
+/// (`mov eax,42; ret`) ignores all arguments, so it keeps working under this calling
+/// convention.
+///
+/// # Safety
+///
+/// `entry` must point to valid, executable, position-appropriate machine code (a mapped PE
+/// entrypoint with relocations applied), and `stack_top` must be a valid, writable,
+/// 16-aligned stack pointer with at least 40 bytes (32 shadow + 8 return address) of usable
+/// space below it. `peb` must be a valid readable pointer if the entrypoint dereferences it
+/// (the loader supplies the live PEB). The caller upholds these by passing the loader's
+/// resolved entrypoint, a freshly allocated [`Stack::top`], and the TEB/PEB's PEB address.
+pub unsafe fn run_entrypoint_win64(entry: *const (), stack_top: *mut u8, peb: *mut ()) -> i32 {
+    let mut result: i32;
+
+    // We reserve 32 bytes of shadow space at [stack_top - 0x20, stack_top). The `call` then
+    // pushes the return address at [stack_top - 0x28], so the entrypoint sees RSP =
+    // stack_top - 0x28 ≡ 8 (mod 16) (since stack_top is 16-aligned), which is the Windows
+    // x64 callee-entry alignment. The shadow space lives at [RSP+8 .. RSP+0x28].
+    //
+    // r12 stashes the caller's RSP (callee-saved by the PE entry under the Windows ABI,
+    // which — like System V — preserves r12/rbp/rbx/r13-r15). We load RCX=peb and RDX=0,
+    // switch to the guest stack with the shadow space carved out, `call` the entrypoint,
+    // and restore RSP from r12. RAX holds the i32 return value (same register in both
+    // ABIs).
+    //
+    // SAFETY: `entry` is a valid executable entrypoint; `stack_top` is 16-aligned with >=
+    // 40 bytes of usable space below it (the loader's Stack guarantees far more); `peb` is
+    // the live PEB pointer. The inline asm only manipulates RSP and the argument registers
+    // and captures RAX; r12 is restored by `mov rsp, r12` (it survives the call because it
+    // is callee-saved).
+    unsafe {
+        asm!(
+            "mov r12, rsp",
+            "mov rcx, {peb}",
+            "xor rdx, rdx",
+            "mov rsp, {sp}",
+            "sub rsp, 0x20",
+            "call {entry}",
+            "mov rsp, r12",
+            sp = in(reg) stack_top,
+            peb = in(reg) peb,
+            entry = in(reg) entry,
+            out("r12") _,
+            out("rax") result,
+            out("rcx") _,
+            out("rdx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+        );
+    }
+
+    result
+}
+
 #[derive(Debug)]
 pub enum BootstrapError {
     /// `arch_prctl(ARCH_SET_GS)` failed.

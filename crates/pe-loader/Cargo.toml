@@ -14,6 +14,7 @@ log.workspace = true
 env_logger.workspace = true
 clap.workspace = true
 nigg-runtime = { path = "../runtime" }
+nigg-ntapi = { path = "../ntapi" }
 
 [dev-dependencies]
 nigg-tests-fixtures = { path = "../../tests/fixtures" }

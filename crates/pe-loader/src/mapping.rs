@@ -372,11 +372,18 @@ fn rva_to_file_offset(bytes: &[u8], rva: u32) -> Option<usize> {
 }
 
 /// Write the resolved IAT entries into the mapped image.
+///
+/// The IAT typically lives in a read-only `.rdata` section whose protection `map_image`
+/// has already downgraded to `PROT_READ`. A real loader makes the IAT pages writable during
+/// import binding (then flips them back); we make the slot's page `PROT_READ|PROT_WRITE`
+/// for the duration of the write and leave it writable (flipping it back to RO is a later
+/// refinement). This matches the Windows loader's "IAT is writable during load" contract.
 pub fn write_iat(
     img: &MappedImage,
     imports: &[goblin::pe::import::Import],
     resolved: &std::collections::HashMap<(String, String), *const c_void>,
 ) {
+    let page = page_size();
     for imp in imports {
         let dll = imp.dll.to_lowercase();
         let sym = imp.name.to_string();
@@ -389,10 +396,29 @@ pub fn write_iat(
             log::warn!("IAT slot at RVA {:#x} out of range", imp.offset);
             continue;
         };
-        // SAFETY: the IAT slot is within the mapped image and was mapped writable (it's
-        // in a read-only-data section per the PE layout, but we mapped everything RW
-        // first; for a fully-correct loader we'd flip it RO after, which is a later
-        // refinement). Writing one u64 is sound.
+        // Make the page(s) covering the 8-byte IAT slot writable before the write. Round the
+        // span [slot, slot+8) to page boundaries so a slot straddling a page edge is covered.
+        let start = (slot as usize) & !(page - 1);
+        let end = round_up(slot as usize + 8, page);
+        let len = end - start;
+        // SAFETY: `start..start+len` is a page-aligned sub-region of the mapping we own
+        // (`slot` was validated to be within `img.base..img.base+img.size`). mprotect to RW
+        // so the slot is writable; we leave it RW (a later refinement restores RO).
+        let rc = unsafe {
+            libc::mprotect(
+                start as *mut c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        };
+        if rc != 0 {
+            log::warn!(
+                "mprotect(RW) of IAT slot at {slot:p} failed (errno {}); write may fault",
+                unsafe { *libc::__errno_location() }
+            );
+        }
+        // SAFETY: the IAT slot is within the mapped image and is now writable. Writing one
+        // u64 is sound; the page was made RW above (or was already RW).
         unsafe { std::ptr::write_unaligned(slot as *mut u64, ptr as u64) };
     }
 }
