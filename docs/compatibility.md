@@ -14,9 +14,11 @@ this project's test harness. Empty cells mean not-yet-reached.
 | Win32 GUI (window + message loop) | ✅ M3 | user32 RegisterClass/CreateWindow/GetMessage/DispatchMessage — headless-safe unit test; wired into pe-loader imports |
 | D3D11 clear+triangle (Rust-native) | ✅ M6b | DXGI swap chain + D3D11 device over Vulkan; HLSL→SPIR-V; clear red + green triangle — verified via `clear_triangle` example |
 | D3D11 sample via nigg-loader (PE) | ✅ M7c | COM vtable for D3D11/DXGI — d3d11_sample.exe + d3d11_triangle.exe both run through nigg-loader, exit 0 |
+| Win32 GUI + D3D11 (game-window PE) | ✅ M7+ | RegisterClassExW + CreateWindowExW + D3D11CreateDeviceAndSwapChain (with HWND) + ClearRenderTargetView + Present + PeekMessageW — game_window.exe exits 0 |
+| Real Windows app (notepad.exe) | ✅ M7+ | Real Windows x64 PE — 92 imports all resolved (0 stubs), survives CRT init + enters message loop |
 | D3D11 indie game | — | M7 |
 | D3D12 clear-screen (Rust-native) | ✅ M8 | D3D12 → Vulkan: Device, CommandQueue, CommandList, DescriptorHeap, Resource, PipelineState, RootSignature — clear-screen test exercises real Vulkan path end-to-end |
-| D3D12 sample via nigg-loader (PE) | — | M8b (COM vtable layer for D3D12 not yet wired) |
+| D3D12 sample via nigg-loader (PE) | ✅ M8b | COM vtable for D3D12 — d3d12_sample.exe runs full command-list pipeline through nigg-loader, exit 0 |
 | Modern D3D11/12 game | — | M9 north star |
 | .NET / WPF app | — | out of initial scope; needs CLR translation |
 
@@ -82,11 +84,25 @@ this project's test harness. Empty cells mean not-yet-reached.
 - Device contexts: GetDC/ReleaseDC, BeginPaint/EndPaint, CreateCompatibleDC/DeleteDC.
 - Painting: ValidateRect, InvalidateRect, DeleteObject, SetPixel.
 
-### Graphics (M6b, M8)
+### Graphics (M6b, M8, M8b)
 - DXGI: Factory (Vulkan instance + device enumeration), SwapChain (headless VkSurfaceKHR + VkSwapchainKHR, Present, GetBuffer, ResizeBuffers).
 - D3D11: Device (CreateTexture2D, CreateRenderTargetView, CreateShader, CreateBuffer), DeviceContext (OMSetRenderTargets, ClearRenderTargetView, VSSetShader, PSSetShader, IASetVertexBuffers, Draw/DrawIndexed, Flush).
 - D3D12 (M8): Device (CreateCommandQueue/Allocator/List, CreateDescriptorHeap, CreateRenderTargetView, CreateCommittedResource, CreatePipelineState, CreateRootSignature), CommandQueue (ExecuteCommandLists), GraphicsCommandList (Close, SetPipelineState, SetRenderTargets, ClearRenderTargetView, ResourceBarrier, SetViewport, SetScissorRect, DrawInstanced), DescriptorHeap (RTV/DSV/CBV_SRV_UAV/Sampler), Resource (Map/Unmap), PipelineState, RootSignature.
 - HLSL→SPIR-V: see compiler coverage table above.
+
+### Anti-cheat support APIs (M7+)
+- Debug detection: IsDebuggerPresent, CheckRemoteDebuggerPresent, OutputDebugStringA/W.
+- Process enumeration: CreateToolhelp32Snapshot, Process32FirstW/NextW, Module32FirstW/NextW.
+- Process memory: OpenProcess, ReadProcessMemory, WriteProcessMemory (self-process → memcpy).
+- Winsock2 (ws2_32.dll, M7+): WSAStartup/Cleanup/GetLastError, socket, connect, bind, listen, accept, send, recv, sendto, recvfrom, setsockopt, getsockopt, ioctlsocket, gethostname, inet_addr, htons/htonl/ntohs/ntohl, shutdown, select — 24 exports for anti-cheat network telemetry.
+- Registry (advapi32.dll): RegOpenKeyW/ExW, RegCreateKeyExW, RegCloseKey, RegQueryValueExW, RegSetValueExW, RegEnumKeyW, RegEnumValueW, RegDeleteKeyW, IsTextUnicode.
+
+### Additional DLLs (M7+)
+- ucrtbase.dll (Universal CRT): 57 exports — malloc/calloc/free/realloc, string functions, CRT init, exit family, formatted I/O.
+- shell32.dll: 12 exports — DragAcceptFiles/Finish/QueryFile, ShellAboutW, ShellExecuteW/A, SHGetFolderPathW/A.
+- shlwapi.dll: 18 exports — path helpers (PathFindFileNameW/A, PathAppendW, etc.), string compare (StrCmpIW/W/NIW/NW), substring search (StrStrW/IW).
+- comdlg32.dll: 7 exports — GetOpenFileNameW, GetSaveFileNameW, ChooseFontW, etc. (stubs).
+- comctl32.dll: InitCommonControls/Ex + ordinals (stubs).
 
 ## Legend
 
