@@ -960,6 +960,39 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
+    // Wire in the comdlg32.dll exports from `nigg-win32-kernel32::comdlg32` (common dialogs:
+    // GetOpenFileNameW/GetSaveFileNameW/ChooseFontW/FindTextW/ReplaceTextW/PrintDlgW/
+    // GetFileTitleW). All are no-ops returning FALSE so callers take their cancel/fallback
+    // path. Same dedup pattern so any symbol already registered keeps its canonical thunk.
+    for e in nigg_win32_kernel32::comdlg32::comdlg32_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the comctl32.dll exports from `nigg-win32-kernel32::comctl32` (common-controls
+    // init: InitCommonControls/InitCommonControlsEx, plus the ordinal 410/413 helpers
+    // notepad.exe imports by ordinal). Same dedup pattern.
+    for e in nigg_win32_kernel32::comctl32::comctl32_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
     specs
 }
 
@@ -1324,5 +1357,67 @@ mod tests {
             .expect("advapi32 RegCreateKeyExW resolved");
         let raw2 = nigg_win32_kernel32::registry::reg_create_key_ex_w as FnPtr;
         assert_ne!(p2, raw2, "build() wraps registry impls in trampolines");
+    }
+
+    #[test]
+    fn default_table_resolves_user32_gdi32_stubs() {
+        // The no-op stubs notepad.exe imports must resolve to a real thunk instead of the
+        // soft-stub trap. Spot-check a representative slice of the new exports.
+        let t = ImplTable::default_table();
+        // user32
+        assert!(t.lookup("user32.dll", "GetSystemMetrics").is_some());
+        assert!(t.lookup("user32.dll", "GetDesktopWindow").is_some());
+        assert!(t.lookup("user32.dll", "MessageBoxW").is_some());
+        assert!(t.lookup("user32.dll", "LoadImageW").is_some());
+        assert!(t.lookup("user32.dll", "DialogBoxParamW").is_some());
+        assert!(t.lookup("user32.dll", "wsprintfW").is_some());
+        // gdi32
+        assert!(t.lookup("gdi32.dll", "SelectObject").is_some());
+        assert!(t.lookup("gdi32.dll", "CreateFontIndirectW").is_some());
+        assert!(t.lookup("gdi32.dll", "GetDeviceCaps").is_some());
+        assert!(t.lookup("gdi32.dll", "StartDocW").is_some());
+        // kernel32 date/time
+        assert!(t.lookup("kernel32.dll", "GetDateFormatW").is_some());
+        assert!(t.lookup("kernel32.dll", "GetTimeFormatW").is_some());
+    }
+
+    #[test]
+    fn default_table_resolves_comdlg32_and_comctl32_exports() {
+        let t = ImplTable::default_table();
+        // comdlg32
+        assert!(t.lookup("comdlg32.dll", "GetOpenFileNameW").is_some());
+        assert!(t.lookup("comdlg32.dll", "GetSaveFileNameW").is_some());
+        assert!(t.lookup("comdlg32.dll", "ChooseFontW").is_some());
+        assert!(t.lookup("comdlg32.dll", "FindTextW").is_some());
+        assert!(t.lookup("comdlg32.dll", "ReplaceTextW").is_some());
+        assert!(t.lookup("comdlg32.dll", "PrintDlgW").is_some());
+        assert!(t.lookup("comdlg32.dll", "GetFileTitleW").is_some());
+        // comctl32 (named + ordinal imports)
+        assert!(t.lookup("comctl32.dll", "InitCommonControls").is_some());
+        assert!(t.lookup("comctl32.dll", "InitCommonControlsEx").is_some());
+        assert!(t.lookup("comctl32.dll", "ORDINAL 410").is_some());
+        assert!(t.lookup("comctl32.dll", "ORDINAL 413").is_some());
+    }
+
+    #[test]
+    fn build_table_wraps_comdlg32_comctl32_in_trampolines() {
+        let mut arena = ThunkArena::new().expect("arena");
+        let t = ImplTable::build(&mut arena);
+        let p = t
+            .lookup("comdlg32.dll", "GetOpenFileNameW")
+            .expect("comdlg32 GetOpenFileNameW resolved");
+        let raw = nigg_win32_kernel32::comdlg32::get_open_file_name_w as FnPtr;
+        assert_ne!(p, raw, "build() wraps comdlg32 impls in trampolines");
+        let p2 = t
+            .lookup("comctl32.dll", "InitCommonControlsEx")
+            .expect("comctl32 InitCommonControlsEx resolved");
+        let raw2 = nigg_win32_kernel32::comctl32::init_common_controls_ex as FnPtr;
+        assert_ne!(p2, raw2, "build() wraps comctl32 impls in trampolines");
+        // Ordinal import must resolve too (it has no named raw fn but the thunk must differ
+        // from any unrelated pointer).
+        let p3 = t
+            .lookup("comctl32.dll", "ORDINAL 410")
+            .expect("comctl32 ORDINAL 410 resolved");
+        assert!(!p3.is_null());
     }
 }

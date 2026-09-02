@@ -555,6 +555,32 @@ pub extern "C" fn wait_for_single_object_ex(handle: Handle, ms: u32, _alertable:
     nigg_ntapi::sync::wait_for_single_object(handle, ms)
 }
 
+/// `kernel32!GetDateFormatW(locale, flags, time, fmt, buf, size) -> int`. Returns 0
+/// (no formatted date produced). The buffers are left untouched.
+pub extern "C" fn get_date_format_w(
+    _locale: u32,
+    _flags: u32,
+    _time: *const c_void,
+    _fmt: *const u16,
+    _buf: *mut u16,
+    _size: i32,
+) -> i32 {
+    0
+}
+
+/// `kernel32!GetTimeFormatW(locale, flags, time, fmt, buf, size) -> int`. Returns 0
+/// (no formatted time produced). The buffers are left untouched.
+pub extern "C" fn get_time_format_w(
+    _locale: u32,
+    _flags: u32,
+    _time: *const c_void,
+    _fmt: *const u16,
+    _buf: *mut u16,
+    _size: i32,
+) -> i32 {
+    0
+}
+
 // ---------------------------------------------------------------------------
 // bcryptprimitives.dll
 // ---------------------------------------------------------------------------
@@ -749,6 +775,8 @@ pub fn extra_export_specs() -> Vec<ExtraSpec> {
             get_console_output_cp,
             0
         ),
+        e!("kernel32.dll", "GetDateFormatW", get_date_format_w, 6),
+        e!("kernel32.dll", "GetTimeFormatW", get_time_format_w, 6),
         // --- kernel32: module / path ---
         e!(
             "kernel32.dll",

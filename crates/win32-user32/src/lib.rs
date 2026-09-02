@@ -13,6 +13,11 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+// The `FAKE_*` constants below are small non-null integer *handle* sentinels (HMENU, HICON,
+// HMONITOR, ...), not pointers to memory. Casting `1 as *mut c_void` is the intended way to
+// spell "a non-null opaque handle"; the `manual_dangling_ptr` lint misreads these as attempts
+// to build a dangling pointer for `NonNull` purposes.
+#![allow(clippy::manual_dangling_ptr)]
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -38,7 +43,7 @@ pub struct Point {
 
 /// Win32 `RECT`.
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Rect {
     pub left: c_int,
     pub top: c_int,
@@ -83,6 +88,29 @@ pub struct WndClassEx {
     pub h_icon_sm: *mut c_void,
 }
 
+/// Win32 `WINDOWPLACEMENT` (44 bytes on x64). We mirror the full layout so a PE's
+/// `&WINDOWPLACEMENT` pointer is read/written at the right offsets.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WindowPlacement {
+    pub length: u32,
+    pub flags: u32,
+    pub show_cmd: u32,
+    pub pt_min_position: Point,
+    pub pt_max_position: Point,
+    pub rc_normal_position: Rect,
+}
+
+/// Win32 `MONITORINFO` (40 bytes on x64).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MonitorInfo {
+    pub cb_size: u32,
+    pub rc_monitor: Rect,
+    pub rc_work: Rect,
+    pub dw_flags: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Window-message constants
 // ---------------------------------------------------------------------------
@@ -104,6 +132,31 @@ pub const WM_LBUTTONUP: u32 = 0x0202;
 pub const SW_SHOW: c_int = 5;
 /// `SW_HIDE`
 pub const SW_HIDE: c_int = 0;
+
+// `GetSystemMetrics` indices we answer with a non-zero default.
+/// `SM_CXSCREEN` (primary screen width in pixels).
+const SM_CXSCREEN: c_int = 0;
+/// `SM_CYSCREEN` (primary screen height in pixels).
+const SM_CYSCREEN: c_int = 1;
+/// Default primary screen width returned by `GetSystemMetrics(SM_CXSCREEN)`.
+const DEFAULT_CXSCREEN: c_int = 640;
+/// Default primary screen height returned by `GetSystemMetrics(SM_CYSCREEN)`.
+const DEFAULT_CYSCREEN: c_int = 480;
+/// `MONITOR_DEFAULTTOPRIMARY`-ish fake monitor handle returned by `MonitorFromRect`.
+const FAKE_HMONITOR: *mut c_void = 1 as *mut c_void;
+/// Fake non-null `HMENU` returned by `GetMenu`/`LoadMenu`-family stubs (we never deliver a
+/// real menu). Stays a small integer so PEs treat it as a valid (empty) menu handle.
+const FAKE_HMENU: *mut c_void = 1 as *mut c_void;
+/// Fake non-null `HICON`/`HCURSOR`/`HIMAGE` handle returned by the `Load*`-family stubs.
+const FAKE_HICON: *mut c_void = 1 as *mut c_void;
+/// Fake non-null `HACCEL` handle returned by `LoadAcceleratorsW`.
+const FAKE_HACCEL: *mut c_void = 1 as *mut c_void;
+/// `RegisterWindowMessageW` returns values in the range `0xC000..=0xFFFF` on Windows; we
+/// hand out a stable high-range id so callers that compare against a registered message id
+/// keep working.
+const FAKE_REGISTERED_MSG: u32 = 0x8000;
+/// Standard 96 DPI returned by `GetDpiForWindow` (user has no DPI override).
+const STANDARD_DPI: u32 = 96;
 
 // ---------------------------------------------------------------------------
 // Thread-local state (wsi::Window is not Send; Win32 message loops are single-thread)
@@ -622,6 +675,261 @@ extern "C" fn set_parent(_hwnd: HWND, _parent: HWND) -> HWND {
 }
 
 // ---------------------------------------------------------------------------
+// Additional user32 exports — simple no-op stubs real PEs (notepad.exe) import.
+// Most return a fixed value (0/TRUE/1) just to satisfy import resolution and CRT init.
+// ---------------------------------------------------------------------------
+
+/// `GetSystemMetrics(int) -> int`. Returns reasonable defaults for the handful of
+/// metrics notepad probes (screen size); 0 for everything else.
+extern "C" fn get_system_metrics(index: c_int) -> c_int {
+    match index {
+        SM_CXSCREEN => DEFAULT_CXSCREEN,
+        SM_CYSCREEN => DEFAULT_CYSCREEN,
+        _ => 0,
+    }
+}
+
+/// `GetDesktopWindow() -> HWND`. Returns a fake non-null desktop HWND.
+extern "C" fn get_desktop_window() -> HWND {
+    1 as *mut c_void
+}
+
+/// `GetMenu(HWND) -> HMENU`. Returns a fake non-null (empty) menu handle.
+extern "C" fn get_menu(_hwnd: HWND) -> *mut c_void {
+    FAKE_HMENU
+}
+
+/// `GetWindowTextLengthW(HWND) -> int`. Returns 0 (empty title length).
+extern "C" fn get_window_text_length_w(_hwnd: HWND) -> c_int {
+    0
+}
+
+/// `GetWindowPlacement(HWND, WINDOWPLACEMENT*) -> BOOL`. Zeroes the struct (preserving
+/// the caller's `length` field, which identifies the struct size on Windows) and returns
+/// TRUE.
+extern "C" fn get_window_placement(_hwnd: HWND, wp: *mut WindowPlacement) -> c_int {
+    if wp.is_null() {
+        return 0;
+    }
+    // SAFETY: the guest provides `wp` valid for one `WindowPlacement` write; we read the
+    // caller's `length` first so the struct size is preserved.
+    unsafe {
+        let length = (*wp).length;
+        wp.write(WindowPlacement {
+            length,
+            flags: 0,
+            show_cmd: 0,
+            pt_min_position: Point::default(),
+            pt_max_position: Point::default(),
+            rc_normal_position: Rect::default(),
+        });
+    }
+    1
+}
+
+/// `GetDlgItem(HWND, int) -> HWND`. Returns NULL (no dialog item).
+extern "C" fn get_dlg_item(_hwnd: HWND, _id: c_int) -> HWND {
+    std::ptr::null_mut()
+}
+
+/// `GetDlgItemTextW(HWND, int, LPWSTR, int) -> UINT`. Returns 0 (no text).
+extern "C" fn get_dlg_item_text_w(_hwnd: HWND, _id: c_int, _buf: *mut u16, _max: c_int) -> u32 {
+    0
+}
+
+/// `GetDlgItemInt(HWND, int, BOOL*, BOOL) -> UINT`. Returns 0 (no value).
+extern "C" fn get_dlg_item_int(
+    _hwnd: HWND,
+    _id: c_int,
+    translated: *mut c_int,
+    _signed: c_int,
+) -> u32 {
+    if !translated.is_null() {
+        // SAFETY: the guest provides `translated` valid for one `c_int` write.
+        unsafe { *translated = 0 };
+    }
+    0
+}
+
+/// `SetDlgItemTextW(HWND, int, LPCWSTR) -> BOOL`. Returns TRUE (text accepted).
+extern "C" fn set_dlg_item_text_w(_hwnd: HWND, _id: c_int, _text: *const u16) -> c_int {
+    1
+}
+
+/// `SetDlgItemInt(HWND, int, UINT, BOOL) -> BOOL`. Returns TRUE.
+extern "C" fn set_dlg_item_int(_hwnd: HWND, _id: c_int, _value: u32, _signed: c_int) -> c_int {
+    1
+}
+
+/// `SetActiveWindow(HWND) -> HWND`. Returns 0 (no previously active window).
+extern "C" fn set_active_window(_hwnd: HWND) -> HWND {
+    std::ptr::null_mut()
+}
+
+/// `SetFocus(HWND) -> HWND`. Returns 0 (no previously focused window).
+extern "C" fn set_focus(_hwnd: HWND) -> HWND {
+    std::ptr::null_mut()
+}
+
+/// `EnableMenuItem(HMENU, UINT, UINT) -> BOOL`. Returns 0 (no previous state).
+extern "C" fn enable_menu_item(_menu: *mut c_void, _id: u32, _flags: u32) -> c_int {
+    0
+}
+
+/// `CheckMenuItem(HMENU, UINT, UINT) -> BOOL`. Returns 0 (no previous state).
+extern "C" fn check_menu_item(_menu: *mut c_void, _id: u32, _flags: u32) -> c_int {
+    0
+}
+
+/// `MessageBoxW(HWND, LPCWSTR, LPCWSTR, UINT) -> int`. Returns `IDOK` (1) without showing
+/// a dialog.
+extern "C" fn message_box_w(
+    _hwnd: HWND,
+    _text: *const u16,
+    _caption: *const u16,
+    _flags: u32,
+) -> c_int {
+    1
+}
+
+/// `LoadIconW(HINSTANCE, LPCWSTR) -> HICON`. Returns a fake non-null icon handle.
+extern "C" fn load_icon_w(_instance: *mut c_void, _name: *const u16) -> *mut c_void {
+    FAKE_HICON
+}
+
+/// `LoadCursorW(HINSTANCE, LPCWSTR) -> HCURSOR`. Returns a fake non-null cursor handle.
+extern "C" fn load_cursor_w(_instance: *mut c_void, _name: *const u16) -> *mut c_void {
+    FAKE_HICON
+}
+
+/// `LoadImageW(HINSTANCE, LPCWSTR, UINT, int, int, UINT) -> HANDLE`. Returns a fake
+/// non-null image handle.
+extern "C" fn load_image_w(
+    _instance: *mut c_void,
+    _name: *const u16,
+    _type: u32,
+    _cx: c_int,
+    _cy: c_int,
+    _flags: u32,
+) -> *mut c_void {
+    FAKE_HICON
+}
+
+/// `LoadStringW(HINSTANCE, UINT, LPWSTR, int) -> int`. Returns 0 (string not found).
+extern "C" fn load_string_w(
+    _instance: *mut c_void,
+    _id: u32,
+    _buf: *mut u16,
+    _max: c_int,
+) -> c_int {
+    0
+}
+
+/// `LoadAcceleratorsW(HINSTANCE, LPCWSTR) -> HACCEL`. Returns a fake non-null handle.
+extern "C" fn load_accelerators_w(_instance: *mut c_void, _name: *const u16) -> *mut c_void {
+    FAKE_HACCEL
+}
+
+/// `TranslateAcceleratorW(HWND, HACCEL, LPMSG) -> int`. Returns 0 (no key translated).
+extern "C" fn translate_accelerator_w(_hwnd: HWND, _accel: *mut c_void, _msg: *const Msg) -> c_int {
+    0
+}
+
+/// `RegisterWindowMessageW(LPCWSTR) -> UINT`. Returns a stable high-range id so callers
+/// comparing against a registered message id keep working.
+extern "C" fn register_window_message_w(_name: *const u16) -> u32 {
+    FAKE_REGISTERED_MSG
+}
+
+/// `IsDialogMessageW(HWND, LPMSG) -> BOOL`. Returns FALSE (not a dialog message).
+extern "C" fn is_dialog_message_w(_hwnd: HWND, _msg: *const Msg) -> c_int {
+    0
+}
+
+/// `IsClipboardFormatAvailable(UINT) -> BOOL`. Returns FALSE (no formats available).
+extern "C" fn is_clipboard_format_available(_format: u32) -> c_int {
+    0
+}
+
+/// `InvalidateRect(HWND, const RECT*, BOOL) -> BOOL`. Marks the window's pending-paint
+/// flag and returns TRUE.
+extern "C" fn invalidate_rect(hwnd: HWND, _rect: *const Rect, _erase: c_int) -> c_int {
+    STATE.with(|s| {
+        if let Some((_, w)) = s.borrow_mut().windows.iter_mut().find(|(h, _)| *h == hwnd) {
+            w.paint_pending = true;
+        }
+    });
+    1
+}
+
+/// `GetDpiForWindow(HWND) -> UINT`. Returns 96 (standard DPI).
+extern "C" fn get_dpi_for_window(_hwnd: HWND) -> u32 {
+    STANDARD_DPI
+}
+
+/// `GetMonitorInfoW(HMONITOR, MONITORINFO*) -> BOOL`. Fills the struct with the primary
+/// screen rect (both `rcMonitor` and `rcWork`) and returns TRUE.
+extern "C" fn get_monitor_info_w(_monitor: *mut c_void, info: *mut MonitorInfo) -> c_int {
+    if info.is_null() {
+        return 0;
+    }
+    let screen = Rect {
+        left: 0,
+        top: 0,
+        right: DEFAULT_CXSCREEN,
+        bottom: DEFAULT_CYSCREEN,
+    };
+    // SAFETY: the guest provides `info` valid for one `MonitorInfo` write; we preserve the
+    // caller's `cb_size` so they can identify the struct variant.
+    unsafe {
+        let cb = (*info).cb_size;
+        info.write(MonitorInfo {
+            cb_size: cb,
+            rc_monitor: screen,
+            rc_work: screen,
+            dw_flags: 0,
+        });
+    }
+    1
+}
+
+/// `MonitorFromRect(const RECT*, DWORD) -> HMONITOR`. Returns a fake non-null monitor
+/// handle.
+extern "C" fn monitor_from_rect(_rect: *const Rect, _flags: u32) -> *mut c_void {
+    FAKE_HMONITOR
+}
+
+/// `DialogBoxParamW(HINSTANCE, LPCWSTR, HWND, DLGPROC, LPARAM) -> int`. Returns -1
+/// (dialog failed to create) so the caller takes its error/fallback path.
+extern "C" fn dialog_box_param_w(
+    _instance: *mut c_void,
+    _name: *const u16,
+    _parent: HWND,
+    _dlg_proc: *mut c_void,
+    _param: isize,
+) -> isize {
+    -1
+}
+
+/// `EndDialog(HWND, INT_PTR) -> BOOL`. Returns TRUE.
+extern "C" fn end_dialog(_hwnd: HWND, _result: isize) -> c_int {
+    1
+}
+
+/// `WinHelpW(HWND, LPCWSTR, UINT, ULONG_PTR) -> BOOL`. Returns FALSE (no help available).
+extern "C" fn win_help_w(_hwnd: HWND, _file: *const u16, _cmd: u32, _data: usize) -> c_int {
+    0
+}
+
+/// `wsprintfW(LPWSTR, LPCWSTR, ...) -> int`. On Windows this is C-variadic; we cannot
+/// express that stably in `extern "C"` Rust, so we model only the two fixed pointer args.
+/// The thunk (n_args=2) shuffles the two register args; the variadic stack args are left
+/// untouched and ignored by this no-op, which returns 0 (no formatting done).
+extern "C" fn wsprintf_w(_buf: *mut u16, _fmt: *const u16) -> c_int {
+    0
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -854,6 +1162,43 @@ pub fn user32_export_specs() -> Vec<ExportSpec> {
         u!("DefWindowProcW", def_window_proc_w, 4),
         u!("GetParent", get_parent, 1),
         u!("SetParent", set_parent, 2),
+        // --- additional stubs real PEs (notepad.exe) import ---
+        u!("GetSystemMetrics", get_system_metrics, 1),
+        u!("GetDesktopWindow", get_desktop_window, 0),
+        u!("GetMenu", get_menu, 1),
+        u!("GetWindowTextLengthW", get_window_text_length_w, 1),
+        u!("GetWindowPlacement", get_window_placement, 2),
+        u!("GetDlgItem", get_dlg_item, 2),
+        u!("GetDlgItemTextW", get_dlg_item_text_w, 4),
+        u!("GetDlgItemInt", get_dlg_item_int, 4),
+        u!("SetDlgItemTextW", set_dlg_item_text_w, 3),
+        u!("SetDlgItemInt", set_dlg_item_int, 4),
+        u!("SetActiveWindow", set_active_window, 1),
+        u!("SetFocus", set_focus, 1),
+        u!("EnableMenuItem", enable_menu_item, 3),
+        u!("CheckMenuItem", check_menu_item, 3),
+        u!("MessageBoxW", message_box_w, 4),
+        u!("LoadIconW", load_icon_w, 2),
+        u!("LoadCursorW", load_cursor_w, 2),
+        u!("LoadImageW", load_image_w, 6),
+        u!("LoadStringW", load_string_w, 4),
+        u!("LoadAcceleratorsW", load_accelerators_w, 2),
+        u!("TranslateAcceleratorW", translate_accelerator_w, 3),
+        u!("RegisterWindowMessageW", register_window_message_w, 1),
+        u!("IsDialogMessageW", is_dialog_message_w, 2),
+        u!(
+            "IsClipboardFormatAvailable",
+            is_clipboard_format_available,
+            1
+        ),
+        u!("InvalidateRect", invalidate_rect, 3),
+        u!("GetDpiForWindow", get_dpi_for_window, 1),
+        u!("GetMonitorInfoW", get_monitor_info_w, 2),
+        u!("MonitorFromRect", monitor_from_rect, 2),
+        u!("DialogBoxParamW", dialog_box_param_w, 5),
+        u!("EndDialog", end_dialog, 2),
+        u!("WinHelpW", win_help_w, 4),
+        u!("wsprintfW", wsprintf_w, 2),
     ]
 }
 
@@ -883,6 +1228,127 @@ mod tests {
         assert!(imports.iter().any(|(_, sym, _)| *sym == "GetMessageW"));
         assert!(imports.iter().any(|(_, sym, _)| *sym == "DispatchMessageW"));
         assert!(imports.iter().all(|(_, _, p)| !p.is_null()));
+    }
+
+    #[test]
+    fn additional_stubs_are_registered() {
+        // The no-op stubs notepad.exe imports must resolve (otherwise the loader falls back to
+        // the soft-stub trap). Verify each is present in the export spec list.
+        let specs = user32_export_specs();
+        let names: Vec<&str> = specs.iter().map(|e| e.sym).collect();
+        for required in [
+            "GetSystemMetrics",
+            "GetDesktopWindow",
+            "GetMenu",
+            "GetWindowTextLengthW",
+            "GetWindowPlacement",
+            "GetDlgItem",
+            "GetDlgItemTextW",
+            "GetDlgItemInt",
+            "SetDlgItemTextW",
+            "SetDlgItemInt",
+            "SetActiveWindow",
+            "SetFocus",
+            "EnableMenuItem",
+            "CheckMenuItem",
+            "MessageBoxW",
+            "LoadIconW",
+            "LoadCursorW",
+            "LoadImageW",
+            "LoadStringW",
+            "LoadAcceleratorsW",
+            "TranslateAcceleratorW",
+            "RegisterWindowMessageW",
+            "IsDialogMessageW",
+            "IsClipboardFormatAvailable",
+            "InvalidateRect",
+            "GetDpiForWindow",
+            "GetMonitorInfoW",
+            "MonitorFromRect",
+            "DialogBoxParamW",
+            "EndDialog",
+            "WinHelpW",
+            "wsprintfW",
+        ] {
+            assert!(
+                names.contains(&required),
+                "user32 export {required} missing from user32_export_specs"
+            );
+        }
+    }
+
+    #[test]
+    fn get_system_metrics_returns_screen_defaults() {
+        assert_eq!(get_system_metrics(0), 640); // SM_CXSCREEN
+        assert_eq!(get_system_metrics(1), 480); // SM_CYSCREEN
+        assert_eq!(get_system_metrics(999), 0); // unknown index
+    }
+
+    #[test]
+    fn desktop_window_and_dpi_stubs() {
+        assert!(!get_desktop_window().is_null());
+        assert_eq!(get_dpi_for_window(std::ptr::null_mut()), 96);
+        assert!(!monitor_from_rect(std::ptr::null(), 0).is_null());
+        assert_eq!(
+            message_box_w(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0),
+            1
+        );
+        assert_eq!(register_window_message_w(std::ptr::null()), 0x8000);
+    }
+
+    #[test]
+    fn get_window_placement_preserves_length() {
+        let mut wp = WindowPlacement {
+            length: 44,
+            flags: 99,
+            show_cmd: 99,
+            pt_min_position: Point { x: 1, y: 2 },
+            pt_max_position: Point { x: 3, y: 4 },
+            rc_normal_position: Rect {
+                left: 1,
+                top: 2,
+                right: 3,
+                bottom: 4,
+            },
+        };
+        assert_eq!(
+            get_window_placement(std::ptr::null_mut(), &mut wp as *mut WindowPlacement),
+            1
+        );
+        assert_eq!(wp.length, 44, "length field must be preserved");
+        assert_eq!(wp.flags, 0);
+        assert_eq!(wp.show_cmd, 0);
+        assert_eq!(wp.rc_normal_position, Rect::default());
+        // Null pointer must return FALSE without writing.
+        assert_eq!(
+            get_window_placement(std::ptr::null_mut(), std::ptr::null_mut()),
+            0
+        );
+    }
+
+    #[test]
+    fn get_monitor_info_fills_screen_rect() {
+        let mut info = MonitorInfo {
+            cb_size: 40,
+            rc_monitor: Rect::default(),
+            rc_work: Rect::default(),
+            dw_flags: 0,
+        };
+        assert_eq!(
+            get_monitor_info_w(std::ptr::null_mut(), &mut info as *mut MonitorInfo),
+            1
+        );
+        assert_eq!(
+            info.rc_monitor,
+            Rect {
+                left: 0,
+                top: 0,
+                right: 640,
+                bottom: 480
+            }
+        );
+        assert_eq!(info.rc_work, info.rc_monitor);
+        assert_eq!(info.cb_size, 40, "cb_size must be preserved");
     }
 
     #[test]

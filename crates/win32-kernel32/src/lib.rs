@@ -39,6 +39,8 @@
 use std::os::raw::c_void;
 
 pub mod anticheat;
+pub mod comctl32;
+pub mod comdlg32;
 pub mod console;
 pub mod crt;
 pub mod env;
