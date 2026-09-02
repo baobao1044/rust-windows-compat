@@ -425,6 +425,141 @@ pub extern "C" fn get_cp_info_ex_w(_code: u32, _flags: u32, lp_info: *mut c_void
     1
 }
 
+// ---------------------------------------------------------------------------
+// advapi32 security descriptors (no-ops — enough for import resolution)
+// ---------------------------------------------------------------------------
+
+/// `advapi32!GetFileSecurityW(path, info, sd, len, needed) -> BOOL`. No-op.
+pub extern "C" fn get_file_security_w(
+    _path: *const u16,
+    _info: u32,
+    _sd: *mut c_void,
+    _len: u32,
+    _needed: *mut u32,
+) -> c_int {
+    0
+}
+
+/// `advapi32!GetSecurityDescriptorOwner(sd, owner, defaulted) -> BOOL`. No-op.
+pub extern "C" fn get_security_descriptor_owner(
+    _sd: *const c_void,
+    _owner: *mut *mut c_void,
+    _defaulted: *mut c_int,
+) -> c_int {
+    0
+}
+
+/// `advapi32!LookupAccountSidW(system, sid, name, name_len, domain, domain_len, use) -> BOOL`.
+pub extern "C" fn lookup_account_sid_w(
+    _system: *const u16,
+    _sid: *const c_void,
+    _name: *mut u16,
+    _name_len: *mut u32,
+    _domain: *mut u16,
+    _domain_len: *mut u32,
+    _use: *mut u32,
+) -> c_int {
+    0
+}
+
+/// `advapi32!RegDeleteValueW(hkey, name) -> LONG`. Returns ERROR_FILE_NOT_FOUND.
+pub extern "C" fn reg_delete_value_w(_hkey: *mut c_void, _name: *const u16) -> c_int {
+    2 // ERROR_FILE_NOT_FOUND
+}
+
+/// `advapi32!RegEnumKeyExW(hkey, index, name, name_len, reserved, class, class_len, ft) -> LONG`.
+pub extern "C" fn reg_enum_key_ex_w(
+    _hkey: *mut c_void,
+    _index: u32,
+    _name: *mut u16,
+    _name_len: *mut u32,
+    _reserved: *mut u32,
+    _class: *mut u16,
+    _class_len: *mut u32,
+    _ft: *mut u64,
+) -> c_int {
+    259 // ERROR_NO_MORE_ITEMS
+}
+
+// ---------------------------------------------------------------------------
+// shell32 file operations (no-ops)
+// ---------------------------------------------------------------------------
+
+/// `shell32!FindExecutableW(file, dir, result) -> HINSTANCE`. Returns NULL.
+pub extern "C" fn find_executable_w(
+    _file: *const u16,
+    _dir: *const u16,
+    _result: *mut u16,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `shell32!SHFileOperationW(lpFileOp) -> int`. Returns 0 (success).
+pub extern "C" fn sh_file_operation_w(_lp_file_op: *mut c_void) -> c_int {
+    0
+}
+
+/// `shell32!SHGetFileInfoW(path, attrs, psfi, cb, flags) -> DWORD`. Returns 0.
+pub extern "C" fn sh_get_file_info_w(
+    _path: *const u16,
+    _attrs: u32,
+    _psfi: *mut c_void,
+    _cb: u32,
+    _flags: u32,
+) -> u32 {
+    0
+}
+
+/// `shell32!ShellExecuteExW(lpExecInfo) -> BOOL`. Returns FALSE.
+pub extern "C" fn shell_execute_ex_w(_lp_exec_info: *mut c_void) -> c_int {
+    0
+}
+
+// ---------------------------------------------------------------------------
+// user32 character functions
+// ---------------------------------------------------------------------------
+
+/// `user32!IsCharAlphaW(ch) -> BOOL`. Returns TRUE if a-z or A-Z.
+pub extern "C" fn is_char_alpha_w(ch: u16) -> c_int {
+    if (b'A' as u16..=b'Z' as u16).contains(&ch) || (b'a' as u16..=b'z' as u16).contains(&ch) {
+        1
+    } else {
+        0
+    }
+}
+
+/// `user32!CharUpperBuffW(buf, len) -> DWORD`. Uppercases in place.
+pub extern "C" fn char_upper_buff_w(buf: *mut u16, len: u32) -> u32 {
+    if buf.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller provides a valid buffer of `len` u16 elements.
+    unsafe {
+        for i in 0..len {
+            let c = *buf.add(i as usize);
+            if (b'a' as u16..=b'z' as u16).contains(&c) {
+                *buf.add(i as usize) = c - 32;
+            }
+        }
+    }
+    len
+}
+
+/// `user32!CharNextExA(codepage, ptr, flags) -> LPCSTR`. Returns ptr+1 (or ptr if NUL).
+pub extern "C" fn char_next_ex_a(_codepage: u16, ptr: *const u8, _flags: u32) -> *const u8 {
+    if ptr.is_null() {
+        return ptr;
+    }
+    // SAFETY: the caller provides a NUL-terminated C string.
+    unsafe {
+        if *ptr == 0 {
+            ptr
+        } else {
+            ptr.add(1)
+        }
+    }
+}
+
 /// The anti-cheat + misc kernel32 exports.
 pub fn anticheat_exports() -> Vec<ExportSpec> {
     macro_rules! k {
@@ -468,5 +603,92 @@ pub fn anticheat_exports() -> Vec<ExportSpec> {
         k!("LocalFree", local_free, 1),
         k!("SetEndOfFile", set_end_of_file, 1),
         k!("GetCPInfoExW", get_cp_info_ex_w, 3),
+        // advapi32 security stubs
+        ExportSpec {
+            dll: "advapi32.dll",
+            sym: "GetFileSecurityW",
+            ptr: get_file_security_w as *const c_void,
+            n_args: 5,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "advapi32.dll",
+            sym: "GetSecurityDescriptorOwner",
+            ptr: get_security_descriptor_owner as *const c_void,
+            n_args: 3,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "advapi32.dll",
+            sym: "LookupAccountSidW",
+            ptr: lookup_account_sid_w as *const c_void,
+            n_args: 7,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "advapi32.dll",
+            sym: "RegDeleteValueW",
+            ptr: reg_delete_value_w as *const c_void,
+            n_args: 2,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "advapi32.dll",
+            sym: "RegEnumKeyExW",
+            ptr: reg_enum_key_ex_w as *const c_void,
+            n_args: 8,
+            noreturn: false,
+        },
+        // shell32 file operation stubs
+        ExportSpec {
+            dll: "shell32.dll",
+            sym: "FindExecutableW",
+            ptr: find_executable_w as *const c_void,
+            n_args: 3,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "shell32.dll",
+            sym: "SHFileOperationW",
+            ptr: sh_file_operation_w as *const c_void,
+            n_args: 1,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "shell32.dll",
+            sym: "SHGetFileInfoW",
+            ptr: sh_get_file_info_w as *const c_void,
+            n_args: 5,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "shell32.dll",
+            sym: "ShellExecuteExW",
+            ptr: shell_execute_ex_w as *const c_void,
+            n_args: 1,
+            noreturn: false,
+        },
+        // user32 character functions
+        ExportSpec {
+            dll: "user32.dll",
+            sym: "IsCharAlphaW",
+            ptr: is_char_alpha_w as *const c_void,
+            n_args: 1,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "user32.dll",
+            sym: "CharUpperBuffW",
+            ptr: char_upper_buff_w as *const c_void,
+            n_args: 2,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "user32.dll",
+            sym: "CharNextExA",
+            ptr: char_next_ex_a as *const c_void,
+            n_args: 3,
+            noreturn: false,
+        },
     ]
 }
