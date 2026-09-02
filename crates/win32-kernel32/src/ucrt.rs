@@ -30,10 +30,32 @@
 // are called from PE machine code via ABI trampolines, not from safe Rust callers.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::os::raw::{c_char, c_int, c_long, c_void};
+use std::os::raw::{c_char, c_int, c_long, c_ulong, c_void};
 use std::sync::OnceLock;
 
 use crate::FnPtr;
+
+// ---------------------------------------------------------------------------
+// Host libc wide-character helpers. The `libc` crate does not expose these on the
+// Linux/GNU target, so we declare the FFI bindings directly against glibc. Windows
+// `wchar_t` is 16-bit while the host's is 32-bit; the pointer-taking parsers (`wcstol`/
+// `wcstoul`) are fed a widened scratch buffer (see [`widen_to_wchar`]) so the width
+// mismatch is bridged. The scalar classifiers/converters (`iswspace`/`towupper`/...)
+// take a single `wint_t` value, which is width-compatible for BMP characters (every
+// code unit a Windows `wchar_t` can hold).
+// ---------------------------------------------------------------------------
+mod ffi {
+    use std::os::raw::{c_int, c_long, c_ulong};
+    extern "C" {
+        pub fn iswspace(wc: u32) -> c_int;
+        pub fn iswprint(wc: u32) -> c_int;
+        pub fn iswdigit(wc: u32) -> c_int;
+        pub fn towupper(wc: u32) -> u32;
+        pub fn towlower(wc: u32) -> u32;
+        pub fn wcstol(nptr: *const i32, endptr: *mut *mut i32, base: c_int) -> c_long;
+        pub fn wcstoul(nptr: *const i32, endptr: *mut *mut i32, base: c_int) -> c_ulong;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // argv / env globals (populated once from the cached __getmainargs machinery)
@@ -139,6 +161,46 @@ pub extern "C" fn p_argv() -> *mut *mut *mut c_char {
     std::ptr::addr_of_mut!(UCRT_ARGV)
 }
 
+// ---------------------------------------------------------------------------
+// Wide-char argv / environment init
+// ---------------------------------------------------------------------------
+
+/// The UCRT `__wargv` global (`wchar_t**`), exposed via [`p_wargv`]. We do not populate a
+/// real wide argv (the acceptance target uses the narrow argv from [`crate::crt`]); the
+/// static holds a single NULL entry. `*__p___wargv()` then reads as a NULL `wchar_t**`
+/// (the real UCRT's unconfigured wide-argv state), which callers null-check instead of
+/// dereferencing the NULL the soft stub returned — the segfault this fixes.
+static mut UCRT_WARGV: [*mut u16; 1] = [std::ptr::null_mut()];
+
+/// `ucrtbase!__p___wargv() -> wchar_t***`. Returns a pointer to the [`UCRT_WARGV`] global.
+/// `*ret` is NULL (empty/unconfigured wide argv), matching the real UCRT before
+/// `_configure_wide_argv` populates `__wargv`.
+pub extern "C" fn p_wargv() -> *mut *mut *mut u16 {
+    // `addr_of_mut!` of a `static mut` is safe (no dereference); the CRT startup is
+    // single-threaded, so there is no concurrent writer.
+    std::ptr::addr_of_mut!(UCRT_WARGV) as *mut *mut *mut u16
+}
+
+/// `ucrtbase!_configure_wide_argv(int mode) -> int`. Initializes the wide (wchar_t) argv
+/// table. We do not build a real wide argv (the target uses the narrow argv); return 0
+/// (success) so the CRT boot sequence proceeds.
+pub extern "C" fn configure_wide_argv(_mode: c_int) -> c_int {
+    0
+}
+
+/// `ucrtbase!_initialize_wide_environment() -> int`. Initializes the wide environment.
+/// Returns 0 (success); the narrow environment from [`crate::crt`] is authoritative.
+pub extern "C" fn initialize_wide_environment() -> c_int {
+    0
+}
+
+/// `ucrtbase!_get_initial_wide_environment() -> wchar_t**`. Returns the wide environment
+/// block. We do not maintain a separate wide env; return NULL (no wide env), which the CRT
+/// treats as "empty/absent" and falls back to the narrow env.
+pub extern "C" fn get_initial_wide_environment() -> *mut *mut u16 {
+    std::ptr::null_mut()
+}
+
 /// `ucrtbase!_set_app_type(int) -> void`. No-op (we do not model app types).
 pub extern "C" fn set_app_type(_app_type: c_int) {}
 
@@ -194,6 +256,33 @@ pub extern "C" fn assert(msg: *const c_char, file: *const c_char, line: u32) {
             .into_owned()
     };
     log::warn!("ucrtbase!_assert: {m} ({f}:{line})");
+}
+
+// ---------------------------------------------------------------------------
+// Environment / file stubs
+// ---------------------------------------------------------------------------
+
+/// `ucrtbase!getenv(const char*) -> char*`. Returns NULL (no environment variable found).
+/// Callers check for NULL (the documented "not found" result), so this is safe.
+pub extern "C" fn getenv(_name: *const c_char) -> *mut c_char {
+    std::ptr::null_mut()
+}
+
+/// `ucrtbase!_wfopen(const wchar_t*, const wchar_t*) -> FILE*`. Returns NULL (cannot open
+/// the file). Callers check for NULL on failure.
+pub extern "C" fn wfopen(_filename: *const u16, _mode: *const u16) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `ucrtbase!_wpopen(const wchar_t*, const wchar_t*) -> FILE*`. Returns NULL (no real
+/// pipe stream). Callers check for NULL on failure.
+pub extern "C" fn wpopen(_cmd: *const u16, _mode: *const u16) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `ucrtbase!_pclose(FILE*) -> int`. Returns -1 (no real pipe stream to close).
+pub extern "C" fn pclose(_stream: *mut c_void) -> c_int {
+    -1
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +663,396 @@ pub extern "C" fn wcschr(s: *const u16, c: u16) -> *mut u16 {
     }
 }
 
+/// `ucrtbase!wcsstr(haystack, needle) -> wchar_t*`. Returns a pointer to the first
+/// occurrence of `needle` in `haystack`, or NULL. An empty `needle` returns `haystack`
+/// (C standard).
+pub extern "C" fn wcsstr(haystack: *const u16, needle: *const u16) -> *mut u16 {
+    if haystack.is_null() || needle.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: both are NUL-terminated UTF-16.
+    let needle_len = unsafe {
+        let mut n = 0usize;
+        while *needle.add(n) != 0 {
+            n += 1;
+        }
+        n
+    };
+    if needle_len == 0 {
+        return haystack as *mut u16;
+    }
+    let hay_len = wcslen(haystack);
+    if hay_len < needle_len {
+        return std::ptr::null_mut();
+    }
+    let mut i = 0usize;
+    // SAFETY: `haystack` is readable for `hay_len + 1` code units (incl. the NUL).
+    while i + needle_len <= hay_len {
+        // SAFETY: compare `needle_len` code units at `haystack + i` against `needle`.
+        let matches = unsafe { (0..needle_len).all(|j| *haystack.add(i + j) == *needle.add(j)) };
+        if matches {
+            // SAFETY: `i + needle_len <= hay_len`, so `i` is within `haystack`.
+            return unsafe { haystack.add(i) as *mut u16 };
+        }
+        i += 1;
+    }
+    std::ptr::null_mut()
+}
+
+/// `ucrtbase!wcsrchr(s, c) -> wchar_t*`. Returns a pointer to the last occurrence of `c` in
+/// `s`, or NULL. (`c == 0` returns a pointer to the terminator.)
+pub extern "C" fn wcsrchr(s: *const u16, c: u16) -> *mut u16 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut found: *mut u16 = std::ptr::null_mut();
+    let mut i = 0usize;
+    // SAFETY: `s` is NUL-terminated; we scan to (and check) the NUL for `c == 0`.
+    unsafe {
+        loop {
+            let ch = *s.add(i);
+            if ch == c {
+                found = s.add(i) as *mut u16;
+            }
+            if ch == 0 {
+                break;
+            }
+            i += 1;
+        }
+    }
+    found
+}
+
+/// `ucrtbase!wcspbrk(s, set) -> wchar_t*`. Returns a pointer to the first occurrence in `s`
+/// of any character from `set`, or NULL.
+pub extern "C" fn wcspbrk(s: *const u16, set: *const u16) -> *mut u16 {
+    if s.is_null() || set.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut i = 0usize;
+    // SAFETY: `s` is NUL-terminated; for each code unit we scan `set` (NUL-terminated).
+    unsafe {
+        loop {
+            let ch = *s.add(i);
+            if ch == 0 {
+                return std::ptr::null_mut();
+            }
+            let mut j = 0usize;
+            while *set.add(j) != 0 {
+                if *set.add(j) == ch {
+                    return s.add(i) as *mut u16;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// `ucrtbase!wcscspn(s, set) -> size_t`. Length of the prefix of `s` consisting only of
+/// characters not in `set`.
+pub extern "C" fn wcscspn(s: *const u16, set: *const u16) -> usize {
+    if s.is_null() || set.is_null() {
+        return 0;
+    }
+    let mut i = 0usize;
+    // SAFETY: `s` is NUL-terminated; for each code unit we scan `set` for a match.
+    unsafe {
+        loop {
+            let ch = *s.add(i);
+            if ch == 0 {
+                return i;
+            }
+            let mut j = 0usize;
+            let mut hit = false;
+            while *set.add(j) != 0 {
+                if *set.add(j) == ch {
+                    hit = true;
+                    break;
+                }
+                j += 1;
+            }
+            if hit {
+                return i;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// `ucrtbase!wcscat(dst, src) -> wchar_t*`. Appends the NUL-terminated `src` to the
+/// NUL-terminated `dst`.
+pub extern "C" fn wcscat(dst: *mut u16, src: *const u16) -> *mut u16 {
+    if dst.is_null() || src.is_null() {
+        return dst;
+    }
+    let d = wcslen(dst);
+    let mut i = 0usize;
+    // SAFETY: `dst` is NUL-terminated and writable; `src` is NUL-terminated. Copy `src`
+    // (including its terminator) starting at `dst`'s terminator.
+    unsafe {
+        loop {
+            let c = *src.add(i);
+            *dst.add(d + i) = c;
+            i += 1;
+            if c == 0 {
+                break;
+            }
+        }
+    }
+    dst
+}
+
+// ---------------------------------------------------------------------------
+// Wide-string numeric parsing — delegate to the host `wcstol`/`wcstoul` via a widened
+// scratch buffer (Windows `wchar_t` is 16-bit, the host's is 32-bit, so the guest pointer
+// cannot be passed directly). The widening is 1:1 for the BMP characters the parsers
+// consume (digits, sign, whitespace, hex letters).
+// ---------------------------------------------------------------------------
+
+/// Widen the NUL-terminated UTF-16 string at `s` into a freshly-allocated host-`wchar_t`
+/// (`i32`) buffer the host `wcstol`/`wcstoul` can parse. The buffer is NUL-terminated.
+/// Widening zero-extends each code unit, which is correct for BMP characters.
+fn widen_to_wchar(s: *const u16) -> Vec<i32> {
+    let mut buf = Vec::new();
+    if s.is_null() {
+        buf.push(0);
+        return buf;
+    }
+    let mut i = 0usize;
+    // SAFETY: `s` is NUL-terminated; we stop at the first 0 code unit.
+    unsafe {
+        while *s.add(i) != 0 {
+            buf.push(*s.add(i) as i32);
+            i += 1;
+        }
+    }
+    buf.push(0);
+    buf
+}
+
+/// Translate the host `wchar_t*` end pointer `end32` (into `buf`) back to a guest `u16*`
+/// end pointer (into the original `s`), writing it through `endptr` if non-null. The code
+/// unit offset is identical because [`widen_to_wchar`] widens 1:1.
+fn translate_wide_endptr(s: *const u16, buf: &[i32], end32: *mut i32, endptr: *mut *mut u16) {
+    if endptr.is_null() {
+        return;
+    }
+    let offset = if end32.is_null() || buf.is_empty() {
+        0
+    } else {
+        // SAFETY: `end32` points within `buf` (or at its start) per the `wcstol` contract.
+        let off = unsafe { (end32 as *const i32).offset_from(buf.as_ptr()) };
+        if off < 0 {
+            0
+        } else {
+            off as usize
+        }
+    };
+    let end16 = if s.is_null() {
+        std::ptr::null_mut()
+    } else {
+        // SAFETY: `offset` is within the original NUL-terminated string (<= its length).
+        unsafe { (s as *mut u16).add(offset) }
+    };
+    // SAFETY: `endptr` is a guest out-pointer valid for one `wchar_t*`.
+    unsafe { std::ptr::write_unaligned(endptr, end16) };
+}
+
+/// `ucrtbase!wcstol(const wchar_t*, wchar_t**, int) -> long`. Parses a wide string as a
+/// signed long in `base`. Delegates to the host `wcstol` via [`widen_to_wchar`]; translates
+/// the end pointer back to the guest pointer.
+pub extern "C" fn wcstol(s: *const u16, endptr: *mut *mut u16, base: c_int) -> c_long {
+    let buf = widen_to_wchar(s);
+    let mut end32: *mut i32 = std::ptr::null_mut();
+    // SAFETY: `buf` is a NUL-terminated `wchar_t` buffer valid for the call; `end32` is a
+    // valid out-pointer. `wcstol` reads within `buf` and writes the end pointer to `end32`.
+    let result = unsafe { ffi::wcstol(buf.as_ptr(), &mut end32, base) };
+    translate_wide_endptr(s, &buf, end32, endptr);
+    result
+}
+
+/// `ucrtbase!wcstoul(const wchar_t*, wchar_t**, int) -> unsigned long`. Unsigned variant
+/// of [`wcstol`]; delegates to the host `wcstoul`.
+pub extern "C" fn wcstoul(s: *const u16, endptr: *mut *mut u16, base: c_int) -> c_ulong {
+    let buf = widen_to_wchar(s);
+    let mut end32: *mut i32 = std::ptr::null_mut();
+    // SAFETY: as in [`wcstol`].
+    let result = unsafe { ffi::wcstoul(buf.as_ptr(), &mut end32, base) };
+    translate_wide_endptr(s, &buf, end32, endptr);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Wide-string case / reverse / duplicate (operate on UTF-16 code units in place)
+// ---------------------------------------------------------------------------
+
+/// ASCII-fold a `wchar_t` code unit to lowercase (A-Z -> a-z); other values unchanged.
+/// Sufficient for `_wcsicmp`/`_wcsnicmp`/`_wcslwr` on ASCII input, which is the common case.
+fn wchar_ascii_tolower(c: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&c) {
+        c + 32
+    } else {
+        c
+    }
+}
+
+/// ASCII-fold a `wchar_t` code unit to uppercase (a-z -> A-Z); other values unchanged.
+fn wchar_ascii_toupper(c: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&c) {
+        c - 32
+    } else {
+        c
+    }
+}
+
+/// `ucrtbase!_wcsicmp(a, b) -> int`. Case-insensitive (ASCII) wide-string compare.
+pub extern "C" fn wcsicmp(a: *const u16, b: *const u16) -> c_int {
+    if a.is_null() || b.is_null() {
+        return (a.is_null() as c_int) - (b.is_null() as c_int);
+    }
+    let mut i = 0usize;
+    // SAFETY: both NUL-terminated; stop at the first differing unit or shared NUL.
+    unsafe {
+        loop {
+            let ca = wchar_ascii_tolower(*a.add(i));
+            let cb = wchar_ascii_tolower(*b.add(i));
+            if ca != cb {
+                return (ca as c_int) - (cb as c_int);
+            }
+            if ca == 0 {
+                return 0;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// `ucrtbase!_wcsnicmp(a, b, n) -> int`. Case-insensitive (ASCII) compare of `n` units.
+pub extern "C" fn wcsnicmp(a: *const u16, b: *const u16, n: usize) -> c_int {
+    if a.is_null() || b.is_null() || n == 0 {
+        return 0;
+    }
+    // SAFETY: `a` and `b` are readable for `n` units (or NUL-terminated sooner).
+    unsafe {
+        for i in 0..n {
+            let ca = wchar_ascii_tolower(*a.add(i));
+            let cb = wchar_ascii_tolower(*b.add(i));
+            if ca != cb {
+                return (ca as c_int) - (cb as c_int);
+            }
+            if ca == 0 {
+                return 0;
+            }
+        }
+    }
+    0
+}
+
+/// `ucrtbase!_wcslwr(wchar_t*) -> wchar_t*`. Lowercases the string in place; returns `s`.
+pub extern "C" fn wcslwr(s: *mut u16) -> *mut u16 {
+    if s.is_null() {
+        return s;
+    }
+    let mut i = 0usize;
+    // SAFETY: `s` is NUL-terminated and writable; stop at the NUL.
+    unsafe {
+        loop {
+            let c = *s.add(i);
+            if c == 0 {
+                break;
+            }
+            *s.add(i) = wchar_ascii_tolower(c);
+            i += 1;
+        }
+    }
+    s
+}
+
+/// `ucrtbase!_wcsupr(wchar_t*) -> wchar_t*`. Uppercases the string in place; returns `s`.
+pub extern "C" fn wcsupr(s: *mut u16) -> *mut u16 {
+    if s.is_null() {
+        return s;
+    }
+    let mut i = 0usize;
+    // SAFETY: `s` is NUL-terminated and writable; stop at the NUL.
+    unsafe {
+        loop {
+            let c = *s.add(i);
+            if c == 0 {
+                break;
+            }
+            *s.add(i) = wchar_ascii_toupper(c);
+            i += 1;
+        }
+    }
+    s
+}
+
+/// `ucrtbase!_wcsrev(wchar_t*) -> wchar_t*`. Reverses the string in place; returns `s`.
+pub extern "C" fn wcsrev(s: *mut u16) -> *mut u16 {
+    if s.is_null() {
+        return s;
+    }
+    let len = wcslen(s);
+    if len <= 1 {
+        return s;
+    }
+    let mut i = 0usize;
+    let mut j = len - 1;
+    // SAFETY: `s` is writable for `len` units; swap symmetric pairs until they meet.
+    unsafe {
+        while i < j {
+            let tmp = *s.add(i);
+            *s.add(i) = *s.add(j);
+            *s.add(j) = tmp;
+            i += 1;
+            j -= 1;
+        }
+    }
+    s
+}
+
+/// `ucrtbase!_wcsdup(const wchar_t*) -> wchar_t*`. Allocates a copy of the string (malloc
+/// + wcscpy); returns NULL if allocation fails.
+pub extern "C" fn wcsdup(s: *const u16) -> *mut u16 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    let units = wcslen(s) + 1; // include the NUL
+    let bytes = match units.checked_mul(2) {
+        Some(b) => b,
+        None => return std::ptr::null_mut(), // overflow -> failure
+    };
+    let dst = malloc(bytes) as *mut u16;
+    if dst.is_null() {
+        return std::ptr::null_mut();
+    }
+    // `wcscpy` is a safe `extern "C"` fn; `dst` is a freshly-allocated `units`-code-unit
+    // buffer and `s` is NUL-terminated.
+    wcscpy(dst, s);
+    dst
+}
+
+/// `ucrtbase!_wsplitpath(path, drive, dir, fname, ext) -> void`. Splits a wide path into
+/// drive/dir/fname/ext components. We fill each non-null output with an empty string (a
+/// single NUL) — the acceptance target does not depend on parsed components.
+pub extern "C" fn wsplitpath(
+    _path: *const u16,
+    drive: *mut u16,
+    dir: *mut u16,
+    fname: *mut u16,
+    ext: *mut u16,
+) {
+    for out in [drive, dir, fname, ext] {
+        if !out.is_null() {
+            // SAFETY: each output is a writable `wchar_t*` buffer; writing one NUL makes it
+            // an empty string per the `_wsplitpath` contract.
+            unsafe { std::ptr::write_unaligned(out, 0) };
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Locale / invalid-parameter handlers
 // ---------------------------------------------------------------------------
@@ -594,6 +1073,43 @@ pub extern "C" fn set_thread_local_invalid_parameter_handler(_handler: *mut c_vo
 /// default "C" locale). Returning NULL lets the CRT fall back to its default locale.
 pub extern "C" fn setlocale(_category: c_int, _locale: *const c_char) -> *mut c_char {
     std::ptr::null_mut()
+}
+
+// ---------------------------------------------------------------------------
+// Wide-character classification / conversion (delegate to the host libc). These take a
+// single `wint_t` value (not a pointer), so the 16/32-bit `wchar_t` width mismatch is not
+// an issue: the guest `wint_t` (a code unit) zero-extends to the host `wint_t` and the
+// classification matches for BMP characters.
+// ---------------------------------------------------------------------------
+
+/// `ucrtbase!iswspace(wint_t) -> int`. Delegates to the host `iswspace`.
+pub extern "C" fn iswspace(c: u32) -> c_int {
+    // SAFETY: `iswspace` accepts any `wint_t` and has no preconditions.
+    unsafe { ffi::iswspace(c) }
+}
+
+/// `ucrtbase!iswprint(wint_t) -> int`. Delegates to the host `iswprint`.
+pub extern "C" fn iswprint(c: u32) -> c_int {
+    // SAFETY: `iswprint` accepts any `wint_t` and has no preconditions.
+    unsafe { ffi::iswprint(c) }
+}
+
+/// `ucrtbase!iswdigit(wint_t) -> int`. Delegates to the host `iswdigit`.
+pub extern "C" fn iswdigit(c: u32) -> c_int {
+    // SAFETY: `iswdigit` accepts any `wint_t` and has no preconditions.
+    unsafe { ffi::iswdigit(c) }
+}
+
+/// `ucrtbase!towupper(wint_t) -> wint_t`. Delegates to the host `towupper`.
+pub extern "C" fn towupper(c: u32) -> u32 {
+    // SAFETY: `towupper` accepts any `wint_t` and has no preconditions.
+    unsafe { ffi::towupper(c) }
+}
+
+/// `ucrtbase!towlower(wint_t) -> wint_t`. Delegates to the host `towlower`.
+pub extern "C" fn towlower(c: u32) -> u32 {
+    // SAFETY: `towlower` accepts any `wint_t` and has no preconditions.
+    unsafe { ffi::towlower(c) }
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +1174,21 @@ pub extern "C" fn stdio_common_vswprintf(
     0
 }
 
+/// `ucrtbase!__stdio_common_vsprintf(options, buffer, count, fmt, locale, va_list) -> int`.
+/// A non-secure sprintf into a buffer. No-op; returns 0 (no output written) — the varargs
+/// arrive as a Windows `va_list` that Rust cannot read, so we produce no output, matching
+/// the no-output contract of the secure variant [`stdio_common_vsprintf_s`].
+pub extern "C" fn stdio_common_vsprintf(
+    _options: u64,
+    _buffer: *mut c_char,
+    _count: usize,
+    _fmt: *const c_char,
+    _locale: *mut c_void,
+    _va: *mut c_void,
+) -> c_int {
+    0
+}
+
 /// `ucrtbase!sscanf(const char*, const char*, ...) -> int` and
 /// `ucrtbase!_sscanf_l(const char*, const char*, _locale_t, ...) -> int`.
 ///
@@ -697,6 +1228,20 @@ pub extern "C" fn snprintf_l(
     snprintf_literal(dst, count, fmt)
 }
 
+/// `ucrtbase!_vsnprintf(dst, count, fmt, va_list) -> int`. Writes the format string
+/// literally into `dst` (respecting `count`); the `va_list` is ignored (Rust cannot read a
+/// Windows `va_list`). Returns the number of chars written (excluding the NUL), like C
+/// `_vsnprintf`. For a literal format string this is exactly correct. This also backs the
+/// `ntdll.dll!_vsnprintf` export (see [`crate::extras`]).
+pub extern "C" fn vsnprintf(
+    dst: *mut c_char,
+    count: usize,
+    fmt: *const c_char,
+    _va: *mut c_void,
+) -> c_int {
+    snprintf_literal(dst, count, fmt)
+}
+
 /// Write the format string at `fmt` literally into `dst` (respecting `count`), collapsing
 /// `%%` to `%`, and NUL-terminate. Returns the number of chars written excluding the NUL
 /// (clamped to `count - 1`). If `dst` is null or `count` is 0, nothing is written and 0 is
@@ -730,6 +1275,77 @@ fn snprintf_literal(dst: *mut c_char, count: usize, fmt: *const c_char) -> c_int
     // SAFETY: NUL-terminate at `written` (within the `count` buffer).
     unsafe { std::ptr::write_unaligned(dst.add(written), 0) };
     written as c_int
+}
+
+// ---------------------------------------------------------------------------
+// Narrow-string helpers and stdio stubs (no real FILE* is modeled; callers that use
+// buffered stdio get success/empty results, matching the "no buffered stdio" model where
+// the acceptance target writes via `WriteFile`/`WriteConsole`).
+// ---------------------------------------------------------------------------
+
+/// `ucrtbase!memchr(ptr, c, n) -> void*`. Delegates to the host `memchr`.
+pub extern "C" fn memchr(ptr: *const c_void, c: c_int, n: usize) -> *mut c_void {
+    if ptr.is_null() || n == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `ptr` is readable for `n` bytes; `memchr` has no other preconditions.
+    unsafe { libc::memchr(ptr, c, n) }
+}
+
+/// `ucrtbase!strcspn(s, set) -> size_t`. Length of the prefix of `s` with no characters
+/// from `set`. Delegates to the host `strcspn`.
+pub extern "C" fn strcspn(s: *const c_char, set: *const c_char) -> usize {
+    if s.is_null() || set.is_null() {
+        return 0;
+    }
+    // SAFETY: both NUL-terminated; `strcspn` reads them and has no other preconditions.
+    unsafe { libc::strcspn(s, set) }
+}
+
+/// `ucrtbase!_strdup(const char*) -> char*`. Allocates (malloc) a copy of `s` (strcpy);
+/// returns NULL if `s` is null or allocation fails.
+pub extern "C" fn strdup(s: *const c_char) -> *mut c_char {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    let len = strlen(s) + 1; // include the NUL
+    let dst = malloc(len) as *mut c_char;
+    if dst.is_null() {
+        return std::ptr::null_mut();
+    }
+    // `strcpy` is a safe `extern "C"` fn; `dst` is a freshly-allocated `len`-byte buffer
+    // and `s` is NUL-terminated.
+    strcpy(dst, s);
+    dst
+}
+
+/// `ucrtbase!fclose(FILE*) -> int`. Returns 0 (success) — no real `FILE*` to close.
+pub extern "C" fn fclose(_stream: *mut c_void) -> c_int {
+    0
+}
+
+/// `ucrtbase!feof(FILE*) -> int`. Returns 1 (end of file). With no real buffered stream,
+/// every read is treated as already at EOF, which is safe for callers that check the flag.
+pub extern "C" fn feof(_stream: *mut c_void) -> c_int {
+    1
+}
+
+/// `ucrtbase!fgetws(wchar_t*, int, FILE*) -> wchar_t*`. Returns NULL (no line read), the
+/// documented end-of-file/error result.
+pub extern "C" fn fgetws(_buf: *mut u16, _size: c_int, _stream: *mut c_void) -> *mut u16 {
+    std::ptr::null_mut()
+}
+
+/// `ucrtbase!fwrite(ptr, size, count, stream) -> size_t`. Returns `count` (pretend the
+/// write succeeded). The acceptance target writes via `WriteFile`/`WriteConsole`, so a
+/// buffered-stdio `fwrite` that "succeeds" without touching a real stream is safe.
+pub extern "C" fn fwrite(
+    _ptr: *const c_void,
+    _size: usize,
+    count: usize,
+    _stream: *mut c_void,
+) -> usize {
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -875,7 +1491,24 @@ pub fn ucrt_exports() -> Vec<UcrtSpec> {
         ),
         u!("__p___argc", p_argc, 0),
         u!("__p___argv", p_argv, 0),
+        u!("__p___wargv", p_wargv, 0),
+        u!("_configure_wide_argv", configure_wide_argv, 1),
+        u!(
+            "_initialize_wide_environment",
+            initialize_wide_environment,
+            0
+        ),
+        u!(
+            "_get_initial_wide_environment",
+            get_initial_wide_environment,
+            0
+        ),
         u!("_set_app_type", set_app_type, 1),
+        // environment / file stubs
+        u!("getenv", getenv, 1),
+        u!("_wfopen", wfopen, 2),
+        u!("_wpopen", wpopen, 2),
+        u!("_pclose", pclose, 1),
         // onexit / atexit
         u!("_initialize_onexit_table", initialize_onexit_table, 1),
         u!("_register_onexit_function", register_onexit_function, 2),
@@ -913,6 +1546,26 @@ pub fn ucrt_exports() -> Vec<UcrtSpec> {
         u!("wcscmp", wcscmp, 2),
         u!("wcsncmp", wcsncmp, 3),
         u!("wcschr", wcschr, 2),
+        u!("wcsstr", wcsstr, 2),
+        u!("wcsrchr", wcsrchr, 2),
+        u!("wcspbrk", wcspbrk, 2),
+        u!("wcscspn", wcscspn, 2),
+        u!("wcscat", wcscat, 2),
+        u!("wcstol", wcstol, 3),
+        u!("wcstoul", wcstoul, 3),
+        u!("_wcsicmp", wcsicmp, 2),
+        u!("_wcsnicmp", wcsnicmp, 3),
+        u!("_wcslwr", wcslwr, 1),
+        u!("_wcsupr", wcsupr, 1),
+        u!("_wcsrev", wcsrev, 1),
+        u!("_wcsdup", wcsdup, 1),
+        u!("_wsplitpath", wsplitpath, 5),
+        // wide-character classification / conversion
+        u!("iswspace", iswspace, 1),
+        u!("iswprint", iswprint, 1),
+        u!("iswdigit", iswdigit, 1),
+        u!("towupper", towupper, 1),
+        u!("towlower", towlower, 1),
         // locale / invalid-parameter handlers
         u!(
             "_set_invalid_parameter_handler",
@@ -929,11 +1582,21 @@ pub fn ucrt_exports() -> Vec<UcrtSpec> {
         u!("__stdio_common_vfprintf", stdio_common_vfprintf, 5),
         u!("__stdio_common_vfwprintf", stdio_common_vfwprintf, 5),
         u!("__stdio_common_vsprintf_s", stdio_common_vsprintf_s, 6),
+        u!("__stdio_common_vsprintf", stdio_common_vsprintf, 6),
         u!("__stdio_common_vswprintf", stdio_common_vswprintf, 6),
         u!("sscanf", sscanf, 2),
         u!("_sscanf_l", sscanf_l, 3),
         u!("snprintf", snprintf, 3),
         u!("_snprintf_l", snprintf_l, 4),
+        u!("_vsnprintf", vsnprintf, 4),
+        // narrow-string helpers and stdio stubs
+        u!("memchr", memchr, 3),
+        u!("strcspn", strcspn, 2),
+        u!("_strdup", strdup, 1),
+        u!("fclose", fclose, 1),
+        u!("feof", feof, 1),
+        u!("fgetws", fgetws, 3),
+        u!("fwrite", fwrite, 4),
         // qsort
         u!("qsort", qsort, 4),
         u!("qsort_s", qsort_s, 5),

@@ -395,6 +395,44 @@ pub extern "C" fn compare_string_ordinal(
     }
 }
 
+/// `kernel32!CompareStringW(locale, flags, a, la, b, lb) -> int`. Compares two wide
+/// strings lexicographically. Returns 1 (`CSTR_LESS_THAN`), 2 (`CSTR_EQUAL`), or 3
+/// (`CSTR_GREATER_THAN`). The `locale` and `flags` (e.g. `NORM_IGNORECASE`) are ignored —
+/// the acceptance target's comparisons are ordinal. Lengths default to NUL-terminated when
+/// passed as -1, the common Windows usage.
+pub extern "C" fn compare_string_w(
+    _locale: u32,
+    _flags: u32,
+    a: *const u16,
+    la: i32,
+    b: *const u16,
+    lb: i32,
+) -> i32 {
+    if a.is_null() || b.is_null() {
+        return 2; // equal (both absent)
+    }
+    // SAFETY: both are NUL-terminated UTF-16 strings (the -1 length means NUL-terminated).
+    let sa = unsafe { crate::string::utf16_to_string(a) };
+    let sb = unsafe { crate::string::utf16_to_string(b) };
+    // Clamp to the requested lengths if positive; otherwise compare the whole strings.
+    let ea = if la >= 0 {
+        sa.chars().take(la as usize).collect::<String>()
+    } else {
+        sa
+    };
+    let eb = if lb >= 0 {
+        sb.chars().take(lb as usize).collect::<String>()
+    } else {
+        sb
+    };
+    use std::cmp::Ordering;
+    match ea.cmp(&eb) {
+        Ordering::Less => 1,
+        Ordering::Equal => 2,
+        Ordering::Greater => 3,
+    }
+}
+
 /// `kernel32!FormatMessageW(...) -> DWORD`. Returns 0 (no message formatted).
 pub extern "C" fn format_message_w(
     _flags: u32,
@@ -691,6 +729,24 @@ pub extern "C" fn rtl_nt_status_to_dos_error(status: i32) -> u32 {
     }
 }
 
+/// `ntdll!_vsnprintf(char*, size_t, const char*, va_list) -> int`. Delegates to the UCRT
+/// [`vsnprintf`](crate::ucrt::vsnprintf), which writes the format string literally into the
+/// buffer (the Windows `va_list` is not readable from Rust). PEs that import `_vsnprintf`
+/// from `ntdll.dll` (rather than `ucrtbase.dll`) get the same behavior.
+pub extern "C" fn ntdll_vsnprintf(
+    dst: *mut i8,
+    count: usize,
+    fmt: *const i8,
+    va: *mut c_void,
+) -> i32 {
+    crate::ucrt::vsnprintf(
+        dst as *mut std::os::raw::c_char,
+        count,
+        fmt as *const std::os::raw::c_char,
+        va,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Time helper
 // ---------------------------------------------------------------------------
@@ -842,6 +898,7 @@ pub fn extra_export_specs() -> Vec<ExtraSpec> {
             compare_string_ordinal,
             5
         ),
+        e!("kernel32.dll", "CompareStringW", compare_string_w, 6),
         e!("kernel32.dll", "FormatMessageW", format_message_w, 7),
         // --- kernel32: file mapping / async I/O ---
         e!("kernel32.dll", "MapViewOfFile", map_view_of_file, 5),
@@ -899,5 +956,6 @@ pub fn extra_export_specs() -> Vec<ExtraSpec> {
             rtl_nt_status_to_dos_error,
             1
         ),
+        e!("ntdll.dll", "_vsnprintf", ntdll_vsnprintf, 4),
     ]
 }

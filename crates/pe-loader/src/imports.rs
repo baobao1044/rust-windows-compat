@@ -993,6 +993,25 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
+    // Wire in the extra kernel32/ntdll exports from `nigg-win32-kernel32::extras2`
+    // (file/directory ops, console screen-buffer helpers, time conversions, process/handle
+    // stubs, disk/volume queries, CompareStringW, RtlGetVersion). These back the import
+    // surface real Windows PEs (cmd.exe, regedit.exe, games, installers) probe during
+    // startup. Same dedup pattern: any symbol already registered (e.g. GetConsoleOutputCP
+    // /GetTempPathW from `extras`) keeps its canonical thunk.
+    for e in nigg_win32_kernel32::extras2::extras2_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
     specs
 }
 
@@ -1419,5 +1438,85 @@ mod tests {
             .lookup("comctl32.dll", "ORDINAL 410")
             .expect("comctl32 ORDINAL 410 resolved");
         assert!(!p3.is_null());
+    }
+
+    #[test]
+    fn default_table_resolves_extras2_exports() {
+        let t = ImplTable::default_table();
+        // File / directory ops.
+        assert!(t.lookup("kernel32.dll", "CreateDirectoryW").is_some());
+        assert!(t.lookup("kernel32.dll", "DeleteFileW").is_some());
+        assert!(t.lookup("kernel32.dll", "RemoveDirectoryW").is_some());
+        assert!(t.lookup("kernel32.dll", "CopyFileW").is_some());
+        assert!(t.lookup("kernel32.dll", "MoveFileW").is_some());
+        assert!(t.lookup("kernel32.dll", "MoveFileExW").is_some());
+        assert!(t.lookup("kernel32.dll", "CreateHardLinkW").is_some());
+        assert!(t.lookup("kernel32.dll", "CreateSymbolicLinkW").is_some());
+        assert!(t.lookup("kernel32.dll", "GetFileAttributesExW").is_some());
+        assert!(t
+            .lookup("kernel32.dll", "GetFileInformationByHandle")
+            .is_some());
+        assert!(t.lookup("kernel32.dll", "GetShortPathNameW").is_some());
+        assert!(t.lookup("kernel32.dll", "GetTempFileNameW").is_some());
+        assert!(t.lookup("kernel32.dll", "SetCurrentDirectoryW").is_some());
+        assert!(t.lookup("kernel32.dll", "FindNextFileW").is_some());
+        // Console.
+        assert!(t.lookup("kernel32.dll", "GetConsoleCP").is_some());
+        assert!(t.lookup("kernel32.dll", "GetOEMCP").is_some());
+        assert!(t
+            .lookup("kernel32.dll", "GetConsoleScreenBufferInfo")
+            .is_some());
+        assert!(t
+            .lookup("kernel32.dll", "SetConsoleCursorPosition")
+            .is_some());
+        assert!(t.lookup("kernel32.dll", "SetConsoleTitleW").is_some());
+        assert!(t
+            .lookup("kernel32.dll", "FillConsoleOutputAttribute")
+            .is_some());
+        assert!(t
+            .lookup("kernel32.dll", "FillConsoleOutputCharacterW")
+            .is_some());
+        assert!(t.lookup("kernel32.dll", "VerifyConsoleIoHandle").is_some());
+        // Time.
+        assert!(t.lookup("kernel32.dll", "GetSystemTime").is_some());
+        assert!(t
+            .lookup("kernel32.dll", "FileTimeToLocalFileTime")
+            .is_some());
+        assert!(t.lookup("kernel32.dll", "FileTimeToSystemTime").is_some());
+        assert!(t.lookup("kernel32.dll", "SystemTimeToFileTime").is_some());
+        assert!(t.lookup("kernel32.dll", "SetFileTime").is_some());
+        assert!(t.lookup("kernel32.dll", "GetLocaleInfoW").is_some());
+        // Process.
+        assert!(t.lookup("kernel32.dll", "CreateProcessW").is_some());
+        assert!(t.lookup("kernel32.dll", "DuplicateHandle").is_some());
+        assert!(t.lookup("kernel32.dll", "LocalAlloc").is_some());
+        assert!(t.lookup("kernel32.dll", "SetStdHandle").is_some());
+        assert!(t.lookup("kernel32.dll", "IsBadStringPtrW").is_some());
+        // Disk / volume.
+        assert!(t.lookup("kernel32.dll", "GetDiskFreeSpaceExW").is_some());
+        assert!(t.lookup("kernel32.dll", "GetVolumeInformationW").is_some());
+        assert!(t.lookup("kernel32.dll", "SetVolumeLabelW").is_some());
+        // String / locale + ntdll.
+        assert!(t.lookup("kernel32.dll", "CompareStringW").is_some());
+        assert!(t.lookup("ntdll.dll", "RtlGetVersion").is_some());
+    }
+
+    #[test]
+    fn build_table_wraps_extras2_in_trampolines() {
+        let mut arena = ThunkArena::new().expect("arena");
+        let t = ImplTable::build(&mut arena);
+        let p = t
+            .lookup("kernel32.dll", "CopyFileW")
+            .expect("CopyFileW resolved");
+        let raw = nigg_win32_kernel32::extras2::copy_file_w as FnPtr;
+        assert_ne!(
+            p, raw,
+            "build() wraps extras2 kernel32 impls in trampolines"
+        );
+        let p2 = t
+            .lookup("ntdll.dll", "RtlGetVersion")
+            .expect("RtlGetVersion resolved");
+        let raw2 = nigg_win32_kernel32::extras2::rtl_get_version as FnPtr;
+        assert_ne!(p2, raw2, "build() wraps extras2 ntdll impls in trampolines");
     }
 }

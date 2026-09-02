@@ -45,6 +45,7 @@ pub mod console;
 pub mod crt;
 pub mod env;
 pub mod extras;
+pub mod extras2;
 pub mod file;
 pub mod heap;
 pub mod process;
