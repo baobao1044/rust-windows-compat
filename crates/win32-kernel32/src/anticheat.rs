@@ -690,5 +690,310 @@ pub fn anticheat_exports() -> Vec<ExportSpec> {
             n_args: 3,
             noreturn: false,
         },
+        // Spotify.exe + complex app stubs
+        k!("EncodePointer", encode_pointer, 1),
+        k!("LoadLibraryA", load_library_a, 1),
+        k!("LoadLibraryW", load_library_w, 1),
+        k!("LoadLibraryExA", load_library_ex_a, 3),
+        k!("LoadLibraryExW", load_library_ex_w, 3),
+        k!("GetProcAddress", get_proc_address, 2),
+        k!("FreeLibrary", free_library, 1),
+        k!("GetSystemTimeAsFileTime", get_system_time_as_file_time, 1),
+        k!("CreateFileMappingW", create_file_mapping_w, 6),
+        k!("MapViewOfFile", map_view_of_file, 5),
+        k!("UnmapViewOfFile", unmap_view_of_file, 1),
+        k!("GetUserNameW", get_user_name_w, 2),
+        k!("GetComputerNameW", get_computer_name_w, 2),
+        ExportSpec {
+            dll: "ntdll.dll",
+            sym: "RtlLookupFunctionEntry",
+            ptr: rtl_lookup_function_entry as *const c_void,
+            n_args: 3,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "bcrypt.dll",
+            sym: "BCryptGenRandom",
+            ptr: bcrypt_gen_random as *const c_void,
+            n_args: 4,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "crypt32.dll",
+            sym: "CertAddCertificateContextToStore",
+            ptr: cert_add_certificate_context_to_store as *const c_void,
+            n_args: 4,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "advapi32.dll",
+            sym: "CryptEncrypt",
+            ptr: crypt_encrypt as *const c_void,
+            n_args: 7,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "ncrypt.dll",
+            sym: "NCryptGetProperty",
+            ptr: ncrypt_get_property as *const c_void,
+            n_args: 6,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "iphlpapi.dll",
+            sym: "GetAdaptersInfo",
+            ptr: get_adapters_info as *const c_void,
+            n_args: 2,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "gdiplus.dll",
+            sym: "GdipGetImageEncoders",
+            ptr: gdip_get_image_encoders as *const c_void,
+            n_args: 3,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "user32.dll",
+            sym: "ReleaseDC",
+            ptr: release_dc as *const c_void,
+            n_args: 2,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "gdi32.dll",
+            sym: "CreateCompatibleBitmap",
+            ptr: create_compatible_bitmap as *const c_void,
+            n_args: 3,
+            noreturn: false,
+        },
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Spotify.exe + complex app stubs
+// ---------------------------------------------------------------------------
+
+/// `kernel32!EncodePointer(ptr) -> PTR`. Returns ptr unchanged (no ASLR cookie).
+pub extern "C" fn encode_pointer(ptr: *mut c_void) -> *mut c_void {
+    ptr
+}
+
+/// `kernel32!LoadLibraryA(name) -> HMODULE`. Returns NULL (can't load DLLs).
+pub extern "C" fn load_library_a(_name: *const u8) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!LoadLibraryW(name) -> HMODULE`. Returns NULL.
+pub extern "C" fn load_library_w(_name: *const u16) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!LoadLibraryExA(name, h, flags) -> HMODULE`. Returns NULL.
+pub extern "C" fn load_library_ex_a(_name: *const u8, _h: *mut c_void, _flags: u32) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!LoadLibraryExW(name, h, flags) -> HMODULE`. Returns NULL.
+pub extern "C" fn load_library_ex_w(
+    _name: *const u16,
+    _h: *mut c_void,
+    _flags: u32,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!GetProcAddress(h, name) -> FARPROC`. Returns NULL.
+pub extern "C" fn get_proc_address(_h: *mut c_void, _name: *const u8) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!FreeLibrary(h) -> BOOL`. Returns TRUE.
+pub extern "C" fn free_library(_h: *mut c_void) -> c_int {
+    1
+}
+
+/// `kernel32!GetSystemTimeAsFileTime(lpFT)`. Fills with current time.
+pub extern "C" fn get_system_time_as_file_time(lp_ft: *mut u64) {
+    if lp_ft.is_null() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    // FILETIME = 100ns intervals since 1601-01-01
+    let filetime = (now.as_nanos() as u64 / 100) + 116_444_736_000_000_000;
+    // SAFETY: caller provides a valid u64 pointer.
+    unsafe { *lp_ft = filetime };
+}
+
+/// `ntdll!RtlLookupFunctionEntry(pc, entry, base) -> PRUNTIME_FUNCTION`. Returns NULL.
+pub extern "C" fn rtl_lookup_function_entry(
+    _pc: u64,
+    _entry: *mut u64,
+    _base: *mut u64,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `bcrypt!BCryptGenRandom(h, buf, len, flags) -> NTSTATUS`. Fills with random.
+pub extern "C" fn bcrypt_gen_random(_h: *mut c_void, buf: *mut u8, len: u32, _flags: u32) -> i32 {
+    if buf.is_null() || len == 0 {
+        return 0; // STATUS_SUCCESS
+    }
+    // SAFETY: caller provides a valid buffer of `len` bytes.
+    unsafe {
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        for i in 0..len as usize {
+            // Simple xorshift64 PRNG
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *buf.add(i) = (seed & 0xFF) as u8;
+        }
+    }
+    0 // STATUS_SUCCESS
+}
+
+/// `crypt32!CertAddCertificateContextToStore(...) -> BOOL`. Returns FALSE.
+pub extern "C" fn cert_add_certificate_context_to_store(
+    _h: *mut c_void,
+    _ctx: *const c_void,
+    _type: u32,
+    _pp: *mut *mut c_void,
+) -> c_int {
+    0
+}
+
+/// `advapi32!CryptEncrypt(...) -> BOOL`. Returns FALSE.
+pub extern "C" fn crypt_encrypt(
+    _hkey: *mut c_void,
+    _hhash: *mut c_void,
+    _final: c_int,
+    _flags: u32,
+    _data: *mut u8,
+    _len: *mut u32,
+    _buf: *mut u8,
+    _bufsize: u32,
+) -> c_int {
+    0
+}
+
+/// `ncrypt!NCryptGetProperty(...) -> NTSTATUS`. Returns error.
+pub extern "C" fn ncrypt_get_property(
+    _h: *mut c_void,
+    _name: *const u16,
+    _buf: *mut u8,
+    _bufsize: u32,
+    _result: *mut u32,
+    _flags: u32,
+) -> i32 {
+    -2147483647 // NTE_BAD_HANDLE as i32
+}
+
+/// `iphlpapi!GetAdaptersInfo(buf, size) -> DWORD`. Returns ERROR_BUFFER_OVERFLOW.
+pub extern "C" fn get_adapters_info(_buf: *mut u8, size: *mut u32) -> u32 {
+    if !size.is_null() {
+        // SAFETY: caller provides a valid u32 pointer.
+        unsafe {
+            *size = 0;
+        }
+    }
+    111 // ERROR_BUFFER_OVERFLOW
+}
+
+/// `gdiplus!GdipGetImageEncoders(size, count, encoders) -> Status`. Returns error.
+pub extern "C" fn gdip_get_image_encoders(
+    _size: u32,
+    _count: *mut u32,
+    _encoders: *mut c_void,
+) -> i32 {
+    1 // GdiplusNotImplemented
+}
+
+/// `user32!ReleaseDC(hwnd, hdc) -> int`. Returns 1.
+pub extern "C" fn release_dc(_hwnd: *mut c_void, _hdc: *mut c_void) -> c_int {
+    1
+}
+
+/// `gdi32!CreateCompatibleBitmap(hdc, w, h) -> HBITMAP`. Returns fake handle.
+pub extern "C" fn create_compatible_bitmap(_hdc: *mut c_void, w: c_int, h: c_int) -> *mut c_void {
+    if w <= 0 || h <= 0 {
+        return std::ptr::null_mut();
+    }
+    0x1000 as *mut c_void // fake bitmap handle
+}
+
+/// `kernel32!CreateFileMappingW(hFile, sa, protect, max_hi, max_lo, name) -> HANDLE`.
+/// Returns a fake handle (we don't implement memory-mapped files).
+pub extern "C" fn create_file_mapping_w(
+    _h_file: *mut c_void,
+    _sa: *const c_void,
+    _protect: u32,
+    _max_hi: u32,
+    _max_lo: u32,
+    _name: *const u16,
+) -> *mut c_void {
+    make_fake_handle()
+}
+
+/// `kernel32!MapViewOfFile(hMapping, access, off_hi, off_lo, size) -> PTR`. Returns NULL.
+pub extern "C" fn map_view_of_file(
+    _h_mapping: *mut c_void,
+    _access: u32,
+    _off_hi: u32,
+    _off_lo: u32,
+    _size: usize,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!UnmapViewOfFile(base) -> BOOL`. Returns TRUE.
+pub extern "C" fn unmap_view_of_file(_base: *const c_void) -> c_int {
+    1
+}
+
+/// `kernel32!GetUserNameW(buf, len) -> BOOL`. Fills with "nigg".
+pub extern "C" fn get_user_name_w(buf: *mut u16, len: *mut u32) -> c_int {
+    if buf.is_null() || len.is_null() {
+        return 0;
+    }
+    let name = b"nigg\0";
+    let needed = name.len() as u32;
+    // SAFETY: caller provides valid buffer and length pointer.
+    unsafe {
+        if *len < needed {
+            *len = needed;
+            return 0;
+        }
+        for (i, &b) in name.iter().enumerate() {
+            *buf.add(i) = b as u16;
+        }
+        *len = needed - 1; // length without NUL
+    }
+    1
+}
+
+/// `kernel32!GetComputerNameW(buf, len) -> BOOL`. Fills with "nigg-pc".
+pub extern "C" fn get_computer_name_w(buf: *mut u16, len: *mut u32) -> c_int {
+    if buf.is_null() || len.is_null() {
+        return 0;
+    }
+    let name = b"nigg-pc\0";
+    let needed = name.len() as u32;
+    // SAFETY: caller provides valid buffer and length pointer.
+    unsafe {
+        if *len < needed {
+            *len = needed;
+            return 0;
+        }
+        for (i, &b) in name.iter().enumerate() {
+            *buf.add(i) = b as u16;
+        }
+        *len = needed - 1;
+    }
+    1
 }
