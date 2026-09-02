@@ -649,22 +649,36 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
-    // TODO(M3): wire in `nigg_win32_user32::user32_imports()` and
-    // `nigg_win32_gdi32::gdi32_imports()` (add `nigg-win32-user32` / `nigg-win32-gdi32` as
-    // deps of nigg-pe-loader). M3 has now landed and exposes both functions, but they return
-    // `(dll, sym, ptr)` triples WITHOUT the `n_args`/`noreturn` metadata the thunk arena
-    // needs (see `ExportSpec` in win32-kernel32 for the richer shape). Two blockers must be
-    // resolved before this can land safely:
-    //   1. The M3 export functions need to carry arg counts (or a per-symbol `n_args` table
-    //      must be maintained here); guessing `n_args` would shuffle the wrong registers
-    //      and silently corrupt Win64->SysV calls.
-    //   2. `CreateWindowExW` takes 12 integer args, exceeding `ThunkArena::make_thunk`'s
-    //      8-arg maximum (`make_thunk` returns `TooManyArgs`, and `ImplTable::build` panics
-    //      on that error) — so wiring it today would panic at every PE load. The thunk
-    //      layer must first be extended to handle >8 stack args, or `CreateWindowExW` must
-    //      be split/excluded.
-    // Until then, user32/gdi32 imports fall through to the trap stub (logged + abort), which
-    // is safe for the M2 console-PE target (it only touches kernel32).
+    // Wire in the M3 user32 exports from `nigg-win32-user32`. Each export carries the
+    // `n_args`/`noreturn` metadata the thunk arena needs; `CreateWindowExW` (12 args) is
+    // handled by the extended thunk layer (>8 stack args). Dedup against anything already
+    // registered so there is a single canonical thunk per `(dll, sym)`.
+    for e in nigg_win32_user32::user32_export_specs() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the M3 gdi32 exports from `nigg-win32-gdi32` (same shape as user32).
+    for e in nigg_win32_gdi32::gdi32_export_specs() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
 
     specs
 }

@@ -48,8 +48,9 @@
 //!   (`ExitProcess`, `NtTerminateProcess`). It shuffles the registers and tail-calls
 //!   (`jmp`) the implementation; no frame or register preservation is needed.
 //!
-//! Both flavors support up to 8 integer arguments (4 register + 4 stack), which covers
-//! every Windows API we implement.
+//! Both flavors support up to 32 integer arguments (4 register + up to 28 stack),
+//! which covers every Windows API we implement (the worst case is `CreateWindowExW`
+//! at 12 args).
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -58,7 +59,7 @@ use std::os::raw::c_void;
 /// Errors raised while building a Win64->SysV trampoline.
 #[derive(Debug, thiserror::Error)]
 pub enum ThunkError {
-    #[error("thunk argument count {n} exceeds the supported maximum of 8")]
+    #[error("thunk argument count {n} exceeds the supported maximum of 32")]
     TooManyArgs { n: u8 },
     #[error("failed to allocate executable thunk memory ({size} bytes): {msg}")]
     AllocFailed { size: usize, msg: String },
@@ -124,14 +125,14 @@ impl ThunkArena {
     }
 
     /// Build a trampoline for a **returning** Rust `extern "C"` function `target` taking
-    /// `n_args` integer/pointer arguments (0..=8), returning the callable address to store
+    /// `n_args` integer/pointer arguments (0..=32), returning the callable address to store
     /// in an IAT slot.
     pub fn make_thunk(
         &mut self,
         target: *const c_void,
         n_args: u8,
     ) -> Result<*const c_void, ThunkError> {
-        if n_args > 8 {
+        if n_args > 32 {
             return Err(ThunkError::TooManyArgs { n: n_args });
         }
         let code = emit_returning(target, n_args);
@@ -255,7 +256,7 @@ impl Drop for ThunkArena {
 }
 
 /// Emit the machine code for a **returning** trampoline targeting `target` with `n_args`
-/// integer arguments (0..=8). See the module docs for the layout.
+/// integer arguments (0..=32). See the module docs for the layout.
 ///
 /// Argument mapping (Windows -> System V):
 ///   win arg1 (rcx) -> sysv arg1 (rdi)
@@ -558,7 +559,7 @@ mod tests {
     #[test]
     fn reject_too_many_args() {
         let mut arena = ThunkArena::new().expect("arena");
-        assert!(arena.make_thunk(echo_first as *const c_void, 9).is_err());
+        assert!(arena.make_thunk(echo_first as *const c_void, 33).is_err());
     }
 
     #[test]

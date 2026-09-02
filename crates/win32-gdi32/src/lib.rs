@@ -150,22 +150,56 @@ extern "C" fn set_pixel(_hdc: HDC, _x: c_int, _y: c_int, color: u32) -> u32 {
 /// The function-pointer type matching `pe-loader`'s `ImplTable`.
 pub type FnPtr = *const c_void;
 
-/// The gdi32 export table the PE loader registers. Each tuple is
-/// `(dll, symbol, function-pointer)`.
-pub fn gdi32_imports() -> Vec<(&'static str, &'static str, FnPtr)> {
+/// Metadata for a single gdi32 export, used by the PE loader to build the ABI thunk for
+/// the import. The loader needs the argument count (to size the Win64->SysV trampoline)
+/// and the `noreturn` flag (always false here — no gdi32 function diverges).
+#[derive(Clone, Copy)]
+pub struct ExportSpec {
+    pub dll: &'static str,
+    pub sym: &'static str,
+    pub ptr: FnPtr,
+    pub n_args: u8,
+    pub noreturn: bool,
+}
+
+/// The full list of gdi32 exports with the metadata the PE loader needs to build ABI
+/// thunks. Callers that only need `(dll, sym, ptr)` triples should use
+/// [`gdi32_imports`] instead.
+pub fn gdi32_export_specs() -> Vec<ExportSpec> {
+    macro_rules! g {
+        ($sym:literal, $f:expr, $n:literal) => {
+            ExportSpec {
+                dll: "gdi32.dll",
+                sym: $sym,
+                ptr: $f as FnPtr,
+                n_args: $n,
+                noreturn: false,
+            }
+        };
+    }
     vec![
-        ("gdi32.dll", "GetDC", get_dc as FnPtr),
-        ("gdi32.dll", "ReleaseDC", release_dc as FnPtr),
-        ("gdi32.dll", "BeginPaint", begin_paint as FnPtr),
-        ("gdi32.dll", "EndPaint", end_paint as FnPtr),
-        ("gdi32.dll", "CreateCompatibleDC", create_compatible_dc as FnPtr),
-        ("gdi32.dll", "DeleteDC", delete_dc as FnPtr),
-        ("gdi32.dll", "ValidateRect", validate_rect as FnPtr),
-        ("gdi32.dll", "InvalidateRect", invalidate_rect as FnPtr),
-        ("gdi32.dll", "GetClientRect", get_client_rect as FnPtr),
-        ("gdi32.dll", "DeleteObject", delete_object as FnPtr),
-        ("gdi32.dll", "SetPixel", set_pixel as FnPtr),
+        g!("GetDC", get_dc, 1),
+        g!("ReleaseDC", release_dc, 2),
+        g!("BeginPaint", begin_paint, 2),
+        g!("EndPaint", end_paint, 2),
+        g!("CreateCompatibleDC", create_compatible_dc, 1),
+        g!("DeleteDC", delete_dc, 1),
+        g!("ValidateRect", validate_rect, 2),
+        g!("InvalidateRect", invalidate_rect, 3),
+        g!("GetClientRect", get_client_rect, 2),
+        g!("DeleteObject", delete_object, 1),
+        g!("SetPixel", set_pixel, 4),
     ]
+}
+
+/// The gdi32 export table the PE loader registers. Each tuple is
+/// `(dll, symbol, function-pointer)`. Prefer [`gdi32_export_specs`] when the loader needs
+/// argument-count metadata for the ABI thunk.
+pub fn gdi32_imports() -> Vec<(&'static str, &'static str, FnPtr)> {
+    gdi32_export_specs()
+        .into_iter()
+        .map(|e| (e.dll, e.sym, e.ptr))
+        .collect()
 }
 
 #[cfg(test)]

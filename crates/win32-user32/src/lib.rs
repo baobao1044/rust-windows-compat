@@ -299,7 +299,11 @@ extern "C" fn create_window_ex_w(
         .with(|s| {
             let st = s.borrow();
             let cls = st.classes.iter().find(|c| c.atom == atom)?;
-            Some((cls.class.lpfn_wnd_proc, width.max(1) as u32, height.max(1) as u32))
+            Some((
+                cls.class.lpfn_wnd_proc,
+                width.max(1) as u32,
+                height.max(1) as u32,
+            ))
         })
         .unwrap_or((std::ptr::null(), 1, 1));
 
@@ -460,12 +464,7 @@ extern "C" fn set_window_text_w(hwnd: HWND, title: *const u16) -> c_int {
 /// posted-message queue, then polls the host window for events and translates them.
 /// Returns 0 on `WM_QUIT`, nonzero otherwise. This implementation does not truly block
 /// (it polls once); a blocking variant can come later. It never returns -1 in M3.
-extern "C" fn get_message_w(
-    lpmsg: *mut Msg,
-    _hwnd: HWND,
-    _min: u32,
-    _max: u32,
-) -> c_int {
+extern "C" fn get_message_w(lpmsg: *mut Msg, _hwnd: HWND, _min: u32, _max: u32) -> c_int {
     if lpmsg.is_null() {
         return -1;
     }
@@ -715,10 +714,7 @@ fn poll_host_event() -> Option<Msg> {
     // Now poll that window's event queue. We re-borrow mutably to reach the Window.
     let ev = STATE.with(|s| {
         let mut st = s.borrow_mut();
-        let entry = st
-            .windows
-            .iter_mut()
-            .find(|(h, _)| *h == hwnd)?;
+        let entry = st.windows.iter_mut().find(|(h, _)| *h == hwnd)?;
         let win = entry.1.window.as_mut()?;
         win.poll_event().ok().flatten()
     })?;
@@ -731,7 +727,11 @@ fn translate_event_to_msg(hwnd: HWND, ev: nigg_wsi::WindowEvent) -> Msg {
     let (message, w, l) = match ev {
         E::Resize { width, height } => {
             update_size(hwnd, width, height);
-            (WM_SIZE, 0, ((width & 0xFFFF) | ((height & 0xFFFF) << 16)) as isize)
+            (
+                WM_SIZE,
+                0,
+                ((width & 0xFFFF) | ((height & 0xFFFF) << 16)) as isize,
+            )
         }
         E::Close => (WM_CLOSE, 0, 0),
         E::Key { code, pressed } => {
@@ -741,7 +741,11 @@ fn translate_event_to_msg(hwnd: HWND, ev: nigg_wsi::WindowEvent) -> Msg {
                 (WM_KEYUP, code as usize, 0)
             }
         }
-        E::MouseMove { x, y } => (WM_MOUSEMOVE, 0, ((x & 0xFFFF) as isize) | ((y & 0xFFFF) as isize) << 16),
+        E::MouseMove { x, y } => (
+            WM_MOUSEMOVE,
+            0,
+            ((x & 0xFFFF) as isize) | ((y & 0xFFFF) as isize) << 16,
+        ),
         E::MouseButton { button, pressed } => {
             let mk = (1u16 << (button as u8)) as usize;
             if pressed {
@@ -789,32 +793,67 @@ fn widestring_to_string(ptr: *const u16) -> String {
 /// The function-pointer type matching `pe-loader`'s `ImplTable`.
 pub type FnPtr = *const c_void;
 
-/// The user32 export table the PE loader registers.
-pub fn user32_imports() -> Vec<(&'static str, &'static str, FnPtr)> {
+/// Metadata for a single user32 export, used by the PE loader to build the ABI thunk for
+/// the import. The loader needs the argument count (to size the Win64->SysV trampoline).
+/// No user32 function diverges, so `noreturn` is always false.
+#[derive(Clone, Copy)]
+pub struct ExportSpec {
+    pub dll: &'static str,
+    pub sym: &'static str,
+    pub ptr: FnPtr,
+    pub n_args: u8,
+    pub noreturn: bool,
+}
+
+/// The full list of user32 exports with the metadata the PE loader needs to build ABI
+/// thunks. `CreateWindowExW` takes 12 args — the loader's thunk layer must support
+/// more than 8 stack args (it does after the M3-integration extension). Callers that
+/// only need `(dll, sym, ptr)` triples should use [`user32_imports`] instead.
+pub fn user32_export_specs() -> Vec<ExportSpec> {
+    macro_rules! u {
+        ($sym:literal, $f:expr, $n:literal) => {
+            ExportSpec {
+                dll: "user32.dll",
+                sym: $sym,
+                ptr: $f as FnPtr,
+                n_args: $n,
+                noreturn: false,
+            }
+        };
+    }
     vec![
-        ("user32.dll", "RegisterClassExW", register_class_ex_w as FnPtr),
-        ("user32.dll", "UnregisterClassW", unregister_class_w as FnPtr),
-        ("user32.dll", "CreateWindowExW", create_window_ex_w as FnPtr),
-        ("user32.dll", "DestroyWindow", destroy_window as FnPtr),
-        ("user32.dll", "ShowWindow", show_window as FnPtr),
-        ("user32.dll", "UpdateWindow", update_window as FnPtr),
-        ("user32.dll", "GetClientRect", get_client_rect as FnPtr),
-        ("user32.dll", "GetWindowRect", get_window_rect as FnPtr),
-        ("user32.dll", "SetWindowPos", set_window_pos as FnPtr),
-        ("user32.dll", "MoveWindow", move_window as FnPtr),
-        ("user32.dll", "GetWindowTextW", get_window_text_w as FnPtr),
-        ("user32.dll", "SetWindowTextW", set_window_text_w as FnPtr),
-        ("user32.dll", "GetMessageW", get_message_w as FnPtr),
-        ("user32.dll", "PeekMessageW", peek_message_w as FnPtr),
-        ("user32.dll", "TranslateMessage", translate_message as FnPtr),
-        ("user32.dll", "DispatchMessageW", dispatch_message_w as FnPtr),
-        ("user32.dll", "PostQuitMessage", post_quit_message as FnPtr),
-        ("user32.dll", "PostMessageW", post_message_w as FnPtr),
-        ("user32.dll", "SendMessageW", send_message_w as FnPtr),
-        ("user32.dll", "DefWindowProcW", def_window_proc_w as FnPtr),
-        ("user32.dll", "GetParent", get_parent as FnPtr),
-        ("user32.dll", "SetParent", set_parent as FnPtr),
+        u!("RegisterClassExW", register_class_ex_w, 1),
+        u!("UnregisterClassW", unregister_class_w, 2),
+        u!("CreateWindowExW", create_window_ex_w, 12),
+        u!("DestroyWindow", destroy_window, 1),
+        u!("ShowWindow", show_window, 2),
+        u!("UpdateWindow", update_window, 1),
+        u!("GetClientRect", get_client_rect, 2),
+        u!("GetWindowRect", get_window_rect, 2),
+        u!("SetWindowPos", set_window_pos, 7),
+        u!("MoveWindow", move_window, 6),
+        u!("GetWindowTextW", get_window_text_w, 3),
+        u!("SetWindowTextW", set_window_text_w, 2),
+        u!("GetMessageW", get_message_w, 4),
+        u!("PeekMessageW", peek_message_w, 5),
+        u!("TranslateMessage", translate_message, 1),
+        u!("DispatchMessageW", dispatch_message_w, 1),
+        u!("PostQuitMessage", post_quit_message, 1),
+        u!("PostMessageW", post_message_w, 4),
+        u!("SendMessageW", send_message_w, 4),
+        u!("DefWindowProcW", def_window_proc_w, 4),
+        u!("GetParent", get_parent, 1),
+        u!("SetParent", set_parent, 2),
     ]
+}
+
+/// The user32 export table the PE loader registers (without arg-count metadata). Prefer
+/// [`user32_export_specs`] when the loader needs argument counts for the ABI thunk.
+pub fn user32_imports() -> Vec<(&'static str, &'static str, FnPtr)> {
+    user32_export_specs()
+        .into_iter()
+        .map(|e| (e.dll, e.sym, e.ptr))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -878,8 +917,18 @@ mod tests {
         assert_ne!(atom, 0);
 
         let hwnd = create_window_ex_w(
-            0, name.as_ptr(), std::ptr::null(), 0, 0, 0, 100, 100,
-            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            0,
+            name.as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            100,
+            100,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
         assert!(!hwnd.is_null());
 
@@ -898,7 +947,10 @@ mod tests {
             dispatch_message_w(&msg as *const Msg);
         }
         // The loop exited (GetMessage returned 0 for WM_QUIT).
-        assert_eq!(get_message_w(&mut msg as *mut Msg, std::ptr::null_mut(), 0, 0), 0);
+        assert_eq!(
+            get_message_w(&mut msg as *mut Msg, std::ptr::null_mut(), 0, 0),
+            0
+        );
 
         // Cleanup: remove the class so it doesn't leak into other tests on the same
         // thread. The window entry was already removed by DestroyWindow.
@@ -930,8 +982,18 @@ mod tests {
         };
         let _atom = register_class_ex_w(&wcx);
         let hwnd = create_window_ex_w(
-            0, name.as_ptr(), std::ptr::null(), 0, 0, 0, 320, 200,
-            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            0,
+            name.as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            320,
+            200,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
         let mut rect = Rect::default();
         assert_eq!(get_client_rect(hwnd, &mut rect as *mut Rect), 1);
