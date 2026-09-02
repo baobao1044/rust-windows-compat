@@ -126,6 +126,58 @@ mod tests {
         assert!(module_has_opfunction(&words));
     }
 
+    /// Structural validation shared by all M6a fixtures: magic, header, and at
+    /// least one `OpFunction`.
+    fn structurally_valid(words: &[u32]) {
+        assert_eq!(words[0], SPIRV_MAGIC, "SPIR-V magic mismatch");
+        assert!(words.len() >= 5, "module shorter than header");
+        let version = words[1].to_le_bytes();
+        assert_eq!(version[2], 1, "major version should be 1");
+        assert!(words[3] > 0, "bound must be positive");
+        assert_eq!(words[4], 0, "schema/reserved word must be 0");
+        assert!(module_has_opfunction(words), "no OpFunction found");
+    }
+
+    #[test]
+    fn compiles_control_flow_fixture() {
+        let src = include_str!("../tests/fixtures/shaders/control_flow.hlsl");
+        let words = compile(src, ShaderStage::Pixel).expect("control_flow compile failed");
+        structurally_valid(&words);
+        if let Some(report) = try_spirv_validate(&words) {
+            eprintln!("control_flow spirv-val:\n{report}");
+        }
+    }
+
+    #[test]
+    fn compiles_cbuffer_fixture() {
+        let src = include_str!("../tests/fixtures/shaders/cbuffer.hlsl");
+        let words = compile(src, ShaderStage::Pixel).expect("cbuffer compile failed");
+        structurally_valid(&words);
+        if let Some(report) = try_spirv_validate(&words) {
+            eprintln!("cbuffer spirv-val:\n{report}");
+        }
+    }
+
+    #[test]
+    fn compiles_texture_fixture() {
+        let src = include_str!("../tests/fixtures/shaders/texture.hlsl");
+        let words = compile(src, ShaderStage::Pixel).expect("texture compile failed");
+        structurally_valid(&words);
+        if let Some(report) = try_spirv_validate(&words) {
+            eprintln!("texture spirv-val:\n{report}");
+        }
+    }
+
+    #[test]
+    fn compiles_vs_input_fixture() {
+        let src = include_str!("../tests/fixtures/shaders/vs_input.hlsl");
+        let words = compile(src, ShaderStage::Vertex).expect("vs_input compile failed");
+        structurally_valid(&words);
+        if let Some(report) = try_spirv_validate(&words) {
+            eprintln!("vs_input spirv-val:\n{report}");
+        }
+    }
+
     /// Scan the assembled words for an `OpFunction` opcode.
     ///
     /// SPIR-V instructions are `(word_count << 16) | opcode`; `OpFunction` is

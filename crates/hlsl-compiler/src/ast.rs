@@ -22,6 +22,17 @@ pub enum Decl {
     CBuffer(CBufferDecl),
     /// A function definition or (forward) declaration.
     Function(FunctionDecl),
+    /// A top-level global variable, e.g. `Texture2D tex : register(t0);`.
+    GlobalVar(GlobalVarDecl),
+}
+
+/// A top-level global variable declaration (e.g. a texture or sampler).
+#[derive(Debug, Clone)]
+pub struct GlobalVarDecl {
+    pub ty: Type,
+    pub name: String,
+    /// Optional register, e.g. `t0`, `s0`.
+    pub register: Option<String>,
 }
 
 /// A `struct` declaration.
@@ -169,6 +180,12 @@ pub enum Expr {
     Construct { ty: Type, args: Vec<Expr> },
     /// `foo(args)` — an ordinary (intrinsic or user) function call.
     Call { name: String, args: Vec<Expr> },
+    /// `obj.method(args)` — a method call (e.g. `tex.Sample(samp, uv)`).
+    MethodCall {
+        base: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
     /// `a.x`, `a.xy`, `color.rgb`, ...
     Member { base: Box<Expr>, member: String },
     /// `a + b`, `a * b`, ...

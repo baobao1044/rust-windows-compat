@@ -38,11 +38,18 @@ struct Parser {
     toks: Vec<Token>,
     /// Index into `toks`; the last token is always `Eof`.
     idx: usize,
+    /// Names of structs declared so far, used to recognise struct types in
+    /// later declarations (e.g. `VSOutput main(VSInput input)`).
+    struct_names: std::collections::HashSet<String>,
 }
 
 impl Parser {
     fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, idx: 0 }
+        Parser {
+            toks,
+            idx: 0,
+            struct_names: std::collections::HashSet::new(),
+        }
     }
 
     // --- token helpers -----------------------------------------------------
@@ -115,6 +122,7 @@ impl Parser {
         match self.peek() {
             TokenKind::Keyword(Keyword::Struct) => {
                 let s = self.parse_struct()?;
+                self.struct_names.insert(s.name.clone());
                 Ok(Decl::Struct(s))
             }
             TokenKind::Keyword(Keyword::CBuffer) => {
@@ -122,10 +130,65 @@ impl Parser {
                 Ok(Decl::CBuffer(c))
             }
             // function or global var beginning with a type
-            _ => {
-                let f = self.parse_function()?;
-                Ok(Decl::Function(f))
+            _ => self.parse_function_or_global_var(),
+        }
+    }
+
+    /// Disambiguate a type-leading top-level declaration into either a
+    /// function definition/prototype or a global variable declaration.
+    ///
+    /// A global variable declaration has the shape `Type name : register(...);`
+    /// or `Type name;` (no parameter list). A function has `Type name ( ... )`.
+    fn parse_function_or_global_var(&mut self) -> Result<Decl> {
+        // Pre-scan: type token(s) then an identifier. If the token after the
+        // identifier is `(`, it's a function; otherwise it's a global variable.
+        let ty = self.parse_type()?;
+        let name = self.expect_ident("function or variable name")?;
+        match self.peek() {
+            TokenKind::LParen => {
+                // function
+                self.bump(); // consume `(`
+                let params = self.parse_params()?;
+                self.expect(&TokenKind::RParen, ")")?;
+                let semantic = self.parse_optional_semantic();
+                if self.eat(&TokenKind::Semicolon) {
+                    return Ok(Decl::Function(FunctionDecl {
+                        return_type: ty,
+                        name,
+                        params,
+                        semantic,
+                        body: None,
+                    }));
+                }
+                self.expect(&TokenKind::LBrace, "{")?;
+                let body = self.parse_block_body()?;
+                self.expect(&TokenKind::RBrace, "}")?;
+                Ok(Decl::Function(FunctionDecl {
+                    return_type: ty,
+                    name,
+                    params,
+                    semantic,
+                    body: Some(body),
+                }))
             }
+            TokenKind::Colon => {
+                // `Type name : register(...);` — global variable with register.
+                let register = self.parse_optional_register();
+                self.expect(&TokenKind::Semicolon, ";")?;
+                Ok(Decl::GlobalVar(GlobalVarDecl { ty, name, register }))
+            }
+            TokenKind::Semicolon => {
+                self.bump();
+                Ok(Decl::GlobalVar(GlobalVarDecl {
+                    ty,
+                    name,
+                    register: None,
+                }))
+            }
+            other => Err(self.unexpected(&format!(
+                "`(`, `:`, or `;` after `{name}`, got {}",
+                other.describe()
+            ))),
         }
     }
 
@@ -206,37 +269,6 @@ impl Parser {
             self.bump();
         }
         self.eat(&TokenKind::RParen);
-    }
-
-    fn parse_function(&mut self) -> Result<FunctionDecl> {
-        let return_type = self.parse_type()?;
-        let name = self.expect_ident("function name")?;
-        self.expect(&TokenKind::LParen, "(")?;
-        let params = self.parse_params()?;
-        self.expect(&TokenKind::RParen, ")")?;
-        let semantic = self.parse_optional_semantic();
-
-        // Forward declaration: `... );`
-        if self.eat(&TokenKind::Semicolon) {
-            return Ok(FunctionDecl {
-                return_type,
-                name,
-                params,
-                semantic,
-                body: None,
-            });
-        }
-
-        self.expect(&TokenKind::LBrace, "{")?;
-        let body = self.parse_block_body()?;
-        self.expect(&TokenKind::RBrace, "}")?;
-        Ok(FunctionDecl {
-            return_type,
-            name,
-            params,
-            semantic,
-            body: Some(body),
-        })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>> {
@@ -324,7 +356,7 @@ impl Parser {
             | TokenKind::Keyword(Keyword::Bool)
             | TokenKind::Keyword(Keyword::SamplerState)
             | TokenKind::Keyword(Keyword::Texture2D) => 1,
-            TokenKind::Ident(s) if is_type_word(s) => 1,
+            TokenKind::Ident(s) if is_type_word(s) || self.struct_names.contains(s) => 1,
             _ => 0,
         }
     }
@@ -457,12 +489,19 @@ impl Parser {
                 }
                 Ok(Type::Texture2D)
             }
-            TokenKind::Ident(s) => decode_type_word(&s).ok_or_else(|| {
-                self.err(
+            TokenKind::Ident(s) => {
+                if let Some(ty) = decode_type_word(&s) {
+                    return Ok(ty);
+                }
+                // A previously-declared struct name is a struct type.
+                if self.struct_names.contains(&s) {
+                    return Ok(Type::Struct(s));
+                }
+                Err(self.err(
                     self.toks[self.idx.saturating_sub(1)].span,
                     format!("unknown type `{s}`"),
-                )
-            }),
+                ))
+            }
             other => Err(self.err(
                 self.toks[self.idx.saturating_sub(1)].span,
                 format!("expected type, got {}", other.describe()),
@@ -691,10 +730,21 @@ impl Parser {
         while let TokenKind::Dot = self.peek() {
             self.bump();
             let member = self.expect_ident("member name")?;
-            e = Expr::Member {
-                base: Box::new(e),
-                member,
-            };
+            // Method call: `.member(args)`. Otherwise it's a plain member access.
+            if self.eat(&TokenKind::LParen) {
+                let args = self.parse_args()?;
+                self.expect(&TokenKind::RParen, ")")?;
+                e = Expr::MethodCall {
+                    base: Box::new(e),
+                    method: member,
+                    args,
+                };
+            } else {
+                e = Expr::Member {
+                    base: Box::new(e),
+                    member,
+                };
+            }
         }
         Ok(e)
     }
