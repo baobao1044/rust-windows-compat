@@ -343,6 +343,12 @@ fn apply_one_reloc(target: *mut u8, typ: u16, delta: i64) -> Result<(), MapError
         }
         // IMAGE_REL_AMD64_ADDR32NB (RVA-only) — no delta for image-relative references.
         3 => Ok(()),
+        // IMAGE_REL_AMD64_SECREL (32-bit section-relative offset) — the offset
+        // is relative to the section start, not the image base, so it doesn't
+        // change when we relocate. Used in .pdata exception tables.
+        10 => Ok(()),
+        // IMAGE_REL_AMD64_SECTION (16-bit section index) — no adjustment needed.
+        11 => Ok(()),
         other => {
             log::debug!("skipping unsupported relocation type {other} at {target:p}");
             Ok(())
