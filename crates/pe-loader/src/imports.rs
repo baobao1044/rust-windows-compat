@@ -14,7 +14,7 @@
 //! Unknown imports get a logging trap stub that aborts gracefully, so a missing import
 //! fails loudly rather than silently calling junk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::raw::c_void;
 
 use crate::thunk::ThunkArena;
@@ -183,7 +183,7 @@ impl ImplTable {
 fn import_specs() -> Vec<ImportSpec> {
     use nigg_ntapi as nt;
 
-    vec![
+    let mut specs: Vec<ImportSpec> = vec![
         // --- kernel32: process / console / time / last-error ---
         ImportSpec {
             dll: "kernel32.dll",
@@ -624,7 +624,49 @@ fn import_specs() -> Vec<ImportSpec> {
             n_args: 3,
             noreturn: false,
         },
-    ]
+    ];
+
+    // Merge in the M2 kernel32 exports from `nigg-win32-kernel32` (files, heap, environment,
+    // console mode, string helpers, command line, etc.). The M1 entries above (ExitProcess,
+    // GetStdHandle, WriteFile, ReadFile, CloseHandle, GetCurrentProcessId,
+    // GetCurrentThreadId) already delegate to ntapi with the correct arg counts, so any
+    // symbol the new crate also defines is dropped from the merge (the existing entry wins).
+    // This keeps a single canonical thunk per `(dll, sym)` and avoids arg-count conflicts.
+    let mut seen: HashSet<(String, String)> = specs
+        .iter()
+        .map(|s| (s.dll.to_string(), s.sym.to_string()))
+        .collect();
+    for e in nigg_win32_kernel32::kernel32_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // TODO(M3): wire in `nigg_win32_user32::user32_imports()` and
+    // `nigg_win32_gdi32::gdi32_imports()` (add `nigg-win32-user32` / `nigg-win32-gdi32` as
+    // deps of nigg-pe-loader). M3 has now landed and exposes both functions, but they return
+    // `(dll, sym, ptr)` triples WITHOUT the `n_args`/`noreturn` metadata the thunk arena
+    // needs (see `ExportSpec` in win32-kernel32 for the richer shape). Two blockers must be
+    // resolved before this can land safely:
+    //   1. The M3 export functions need to carry arg counts (or a per-symbol `n_args` table
+    //      must be maintained here); guessing `n_args` would shuffle the wrong registers
+    //      and silently corrupt Win64->SysV calls.
+    //   2. `CreateWindowExW` takes 12 integer args, exceeding `ThunkArena::make_thunk`'s
+    //      8-arg maximum (`make_thunk` returns `TooManyArgs`, and `ImplTable::build` panics
+    //      on that error) — so wiring it today would panic at every PE load. The thunk
+    //      layer must first be extended to handle >8 stack args, or `CreateWindowExW` must
+    //      be split/excluded.
+    // Until then, user32/gdi32 imports fall through to the trap stub (logged + abort), which
+    // is safe for the M2 console-PE target (it only touches kernel32).
+
+    specs
 }
 
 /// The api-ms-win-* pseudo-DLL names we forward implemented symbols to (they are API-set
@@ -642,6 +684,11 @@ const APISETS: &[&str] = &[
     "api-ms-win-core-heap-l1-1-0",
     "api-ms-win-core-memory-l1-1-0",
     "api-ms-win-core-file-l1-1-0",
+    "api-ms-win-core-file-l2-1-0",
+    "api-ms-win-core-string-l1-1-0",
+    "api-ms-win-core-stringansi-l1-1-0",
+    "api-ms-win-core-processenvironment-l1-1-0",
+    "api-ms-win-core-localization-l1-2-0",
 ];
 
 /// The kernel32 symbols forwarded to each apiset (so apiset-named imports resolve too).
@@ -694,6 +741,36 @@ const FORWARD_SYMBOLS: &[&str] = &[
     "TlsFree",
     "TlsGetValue",
     "TlsSetValue",
+    // --- M2 kernel32 (console / files / heap / env / process / string) ---
+    "WriteConsoleW",
+    "WriteConsoleA",
+    "GetConsoleMode",
+    "SetConsoleMode",
+    "CreateFileW",
+    "CreateFileA",
+    "GetFileSize",
+    "SetFilePointer",
+    "FlushFileBuffers",
+    "GetProcessHeap",
+    "HeapAlloc",
+    "HeapFree",
+    "HeapReAlloc",
+    "HeapCreate",
+    "HeapDestroy",
+    "GetEnvironmentVariableW",
+    "SetEnvironmentVariableW",
+    "GetEnvironmentStringsW",
+    "FreeEnvironmentStringsW",
+    "GetModuleHandleW",
+    "GetModuleHandleA",
+    "GetCommandLineW",
+    "GetCommandLineA",
+    "MultiByteToWideChar",
+    "WideCharToMultiByte",
+    "lstrlenW",
+    "lstrlenA",
+    "lstrcpyW",
+    "lstrcatW",
 ];
 
 /// Forward `FORWARD_SYMBOLS` from kernel32 to each apiset, allocating shared thunks (one

@@ -88,3 +88,41 @@ fn nigg_loader_reports_usage_with_no_args() {
     // clap exits with code 2 on missing-required-argument errors.
     assert_eq!(output.status.code(), Some(2));
 }
+
+/// M2 acceptance test: the hand-built console PE that imports `kernel32!GetStdHandle`,
+/// `kernel32!WriteFile`, and `kernel32!ExitProcess` must run end-to-end through the full
+/// stack, print `hello` to stdout, and exit with code 0.
+///
+/// This validates the full M2 kernel32 surface wired into the import table: the
+/// `GetStdHandle(STD_OUTPUT_HANDLE)` -> fd 1 delegation, `WriteFile` through the ntapi
+/// fd resolver (which no longer spuriously closes the fd — the bug fixed in M2), and
+/// `ExitProcess(0)` terminating the process with code 0. The test runs `nigg-loader` as a
+/// subprocess and asserts `stdout` contains `hello` and the exit code is `0`.
+#[test]
+fn nigg_loader_runs_console_pe_prints_hello_and_exits_0() {
+    let bytes = nigg_tests_fixtures::minimal_console_pe();
+    let exe_path = write_temp_pe("console", &bytes);
+
+    let output = Command::new(BIN)
+        .arg(&exe_path)
+        .output()
+        .expect("run nigg-loader");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let _ = fs::remove_file(&exe_path);
+
+    assert!(
+        stdout.contains("hello"),
+        "nigg-loader stdout must contain 'hello' for the console PE (got \
+         {stdout:?})\nstderr={stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "nigg-loader must exit 0 when the PE calls ExitProcess(0) (got {:?})\n\
+         stdout={stdout}\nstderr={stderr}",
+        output.status.code()
+    );
+}

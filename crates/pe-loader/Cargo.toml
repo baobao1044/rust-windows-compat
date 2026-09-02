@@ -15,6 +15,9 @@ env_logger.workspace = true
 clap.workspace = true
 nigg-runtime = { path = "../runtime" }
 nigg-ntapi = { path = "../ntapi" }
+nigg-win32-kernel32 = { path = "../win32-kernel32" }
+# TODO(M3): nigg-win32-user32 = { path = "../win32-user32" }
+# TODO(M3): nigg-win32-gdi32 = { path = "../win32-gdi32" }
 
 [dev-dependencies]
 nigg-tests-fixtures = { path = "../../tests/fixtures" }

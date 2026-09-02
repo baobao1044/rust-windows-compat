@@ -63,6 +63,16 @@ memmap2 = "0.9"
 byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 
+# Internal workspace crates (path-based, shared via `foo.workspace = true` so sibling
+# crates can depend on each other without repeating the path).
+nigg-ntapi = { path = "crates/ntapi" }
+nigg-runtime = { path = "crates/runtime" }
+nigg-pe-loader = { path = "crates/pe-loader" }
+nigg-win32-kernel32 = { path = "crates/win32-kernel32" }
+nigg-win32-user32 = { path = "crates/win32-user32" }
+nigg-win32-gdi32 = { path = "crates/win32-gdi32" }
+nigg-wsi = { path = "crates/wsi" }
+
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"

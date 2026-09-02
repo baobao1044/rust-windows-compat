@@ -183,14 +183,21 @@ pub extern "C" fn read_file(
 
 /// Resolve a Windows handle to a Linux fd. Stdio handles (0/1/2) pass through; file handles
 /// in the table carry their fd.
+///
+/// This reads the fd *without* cloning the `FileObject`: `Object::clone_ref` would copy the
+/// raw fd into a temporary `FileObject` whose `Drop` calls `libc::close(fd)`, which would
+/// close the real descriptor as soon as the temporary dropped. Reading the fd directly via
+/// the closure (returning a plain `i32`, not a `FileObject`) avoids the spurious close.
 fn resolve_fd(handle: Handle) -> i32 {
     if handle <= 2 {
         return handle as i32;
     }
-    if let Some(Object::File(f)) = handle::with_object(handle, |o| o.clone_ref()) {
-        return f.fd;
-    }
-    -1
+    handle::with_object(handle, |o| match o {
+        Object::File(f) => Some(f.fd),
+        _ => None,
+    })
+    .flatten()
+    .unwrap_or(-1)
 }
 
 /// `kernel32!CloseHandle(HANDLE) -> BOOL`.
