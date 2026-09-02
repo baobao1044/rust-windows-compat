@@ -1,0 +1,28 @@
+[package]
+name = "nigg-d3d11-sample"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# M7a D3D11 sample PE. A `#![no_std]`/`#![no_main]` Windows program that imports
+# only `d3d11.dll`/`dxgi.dll`/`kernel32.dll` (via raw-dylib + a custom entry
+# point, no CRT), so the whole import surface fits the PE loader's COM thunk
+# layer. `panic = "abort"` is required because a no_std core cannot unwind and
+# the panic handler loops anyway. This is a standalone workspace (not a member
+# of the parent workspace) so its own profiles apply. Build (cross-compile):
+#   cargo build --target x86_64-pc-windows-gnu --manifest-path tests/d3d11-sample/Cargo.toml
+
+[[bin]]
+name = "d3d11_sample"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+# Standalone workspace so the parent workspace's profiles do not override
+# `panic = "abort"` (workspace members inherit the root's profiles).
+[workspace]

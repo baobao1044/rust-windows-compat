@@ -1,0 +1,18 @@
+[package]
+name = "nigg-d3d11-com"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# COM vtable layer for D3D11/DXGI (workstream M7a). Wraps the existing Rust-native
+# `nigg-d3d11`/`nigg-dxgi` Vulkan translation in COM objects whose vtable slots are
+# Win64->SysV ABI thunks, so a Windows PE can call D3D11/DXGI through real vtables
+# end-to-end. The thunk memory itself is owned by the PE loader's `ThunkArena`; this
+# crate receives a thunk-creation callback (`ComVtables::install`) so it has no
+# dependency on the loader crate (avoids a workspace dependency cycle).
+
+[dependencies]
+ash.workspace = true
+nigg-d3d11 = { path = "../d3d11" }
+nigg-dxgi = { path = "../dxgi" }
+log.workspace = true

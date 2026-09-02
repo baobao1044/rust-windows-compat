@@ -12,6 +12,7 @@ members = [
     "crates/audio",
     "crates/dxgi",
     "crates/d3d11",
+    "crates/d3d11-com",
     "crates/d3d12",
     "crates/hlsl-compiler",
     "crates/tests",

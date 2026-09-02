@@ -136,6 +136,12 @@ impl ImplTable {
     /// Build the table of M1 implemented exports, wrapping each implementation in a
     /// Win64->SysV trampoline allocated from `arena`. The arena must be `finalize()`d
     /// (flipped to PROT_EXEC) before any IAT entry is called.
+    ///
+    /// This also installs the M7a D3D11/DXGI COM vtables: a Win64->SysV thunk is
+    /// allocated (from the same `arena`) for every vtable slot, and the
+    /// import-level D3D11/DXGI exports (`D3D11CreateDeviceAndSwapChain`,
+    /// `CreateDXGIFactory`, ...) are registered as thunks too. Both must happen
+    /// before `arena.finalize()` (the caller seals the arena after this returns).
     pub fn build(arena: &mut ThunkArena) -> Self {
         let specs = import_specs();
         let mut map = HashMap::new();
@@ -153,6 +159,28 @@ impl ImplTable {
         }
         // Forward the implemented symbols to the api-ms-win-* pseudo-DLLs too.
         forward_apisets(&mut map, arena);
+
+        // --- M7a: install the D3D11/DXGI COM vtables ---
+        // Allocate a Win64->SysV thunk for every vtable slot (the vtable structs
+        // are leaked inside `install_vtables` so their addresses stay valid for
+        // the PE's lifetime). The same `arena` backs these thunks, so they are
+        // sealed along with the rest when the caller calls `arena.finalize()`.
+        nigg_d3d11_com::install_vtables(&mut |target, n_args| {
+            arena
+                .make_thunk(target, n_args)
+                .unwrap_or_else(|e| panic!("COM vtable thunk failed: {e}"))
+        });
+        // Register the import-level D3D11/DXGI exports as thunks (same mechanism
+        // as the kernel32/user32 exports above). These are the functions a PE
+        // links against; calling them creates the COM objects and hands their
+        // interface pointers back to the PE.
+        for spec in nigg_d3d11_com::com_export_specs() {
+            let ptr = arena
+                .make_thunk(spec.target, spec.n_args)
+                .unwrap_or_else(|e| panic!("thunk for {}!{} failed: {e}", spec.dll, spec.sym));
+            map.insert((spec.dll.to_string(), spec.sym.to_string()), ptr);
+        }
+
         ImplTable { map }
     }
 
