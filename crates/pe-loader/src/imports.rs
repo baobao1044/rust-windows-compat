@@ -780,10 +780,64 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
+    // Wire in the ucrtbase.dll (Universal CRT) function exports from
+    // `nigg-win32-kernel32::ucrt`. Modern Windows apps import the C runtime from
+    // `ucrtbase.dll` (distinct startup surface: `_configure_narrow_argv`,
+    // `__p___argc`, `_register_onexit_function`, plus the usual memory/string/exit
+    // family). Dedup so symbols already registered (e.g. ucrtbase memset/memcpy/memmove
+    // wired above, or msvcrt entries under msvcrt.dll) keep their canonical thunk — only
+    // genuinely new `(ucrtbase.dll, sym)` keys are added.
+    for e in nigg_win32_kernel32::ucrt::ucrt_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
     // Wire in the extra kernel32/ntdll/bcryptprimitives/userenv exports from
     // `nigg-win32-kernel32::extras` (exception handling stubs, system info, file/path
     // helpers, ProcessPrng, GetUserProfileDirectoryW, RtlNtStatusToDosError, etc.).
     for e in nigg_win32_kernel32::extras::extra_export_specs() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the anti-cheat + misc kernel32 exports (IsDebuggerPresent,
+    // CreateToolhelp32Snapshot, OpenProcess, ReadProcessMemory, etc.). These
+    // are the process-enumeration and debug-detection APIs userland anti-cheat
+    // DLLs (EAC, BattlEye) call during initialization. Same dedup pattern.
+    for e in nigg_win32_kernel32::anticheat::anticheat_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the advapi32.dll registry exports from `nigg-win32-kernel32::registry`
+    // (RegOpenKeyW/ExW, RegCreateKeyExW, RegCloseKey, RegQueryValueExW, RegSetValueExW,
+    // RegEnumKeyW, RegEnumValueW, RegDeleteKeyW, IsTextUnicode). These back the minimal
+    // in-memory registry real PEs probe during startup. Same dedup pattern.
+    for e in nigg_win32_kernel32::registry::registry_exports() {
         let key = (e.dll.to_string(), e.sym.to_string());
         if seen.insert(key) {
             specs.push(ImportSpec {
@@ -847,6 +901,37 @@ fn import_specs() -> Vec<ImportSpec> {
 
     // Wire in the M3 gdi32 exports from `nigg-win32-gdi32` (same shape as user32).
     for e in nigg_win32_gdi32::gdi32_export_specs() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the shell32.dll exports from `nigg-win32-kernel32::shell32` (drag-drop no-ops,
+    // ShellExecute/SHGetFolderPath stubs, SHGetDesktopFolder/SHGetMalloc). These let real
+    // PEs (notepad.exe, games, installers) resolve their shell32 imports.
+    for e in nigg_win32_kernel32::shell32::shell32_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the shlwapi.dll exports from `nigg-win32-kernel32::shlwapi` (path utilities
+    // PathFindFileName/PathCombine/PathIsRelative, and the StrCmp*/StrStr* string helpers).
+    for e in nigg_win32_kernel32::shlwapi::shlwapi_exports() {
         let key = (e.dll.to_string(), e.sym.to_string());
         if seen.insert(key) {
             specs.push(ImportSpec {
@@ -1119,5 +1204,109 @@ mod tests {
         let t = ImplTable::default_table();
         assert!(t.lookup("kernel32.dll", "WriteFile").is_some());
         assert!(t.lookup("kernel32.dll", "MysteryFunc").is_none());
+    }
+
+    #[test]
+    fn default_table_resolves_shell32_exports() {
+        let t = ImplTable::default_table();
+        assert!(t.lookup("shell32.dll", "ShellExecuteW").is_some());
+        assert!(t.lookup("shell32.dll", "ShellExecuteA").is_some());
+        assert!(t.lookup("shell32.dll", "SHGetFolderPathW").is_some());
+        assert!(t.lookup("shell32.dll", "SHGetFolderPathA").is_some());
+        assert!(t.lookup("shell32.dll", "SHGetSpecialFolderPathW").is_some());
+        assert!(t.lookup("shell32.dll", "DragQueryFileW").is_some());
+        assert!(t.lookup("shell32.dll", "SHGetDesktopFolder").is_some());
+        assert!(t.lookup("shell32.dll", "SHGetMalloc").is_some());
+    }
+
+    #[test]
+    fn default_table_resolves_shlwapi_exports() {
+        let t = ImplTable::default_table();
+        assert!(t.lookup("shlwapi.dll", "PathFindFileNameW").is_some());
+        assert!(t.lookup("shlwapi.dll", "PathFindFileNameA").is_some());
+        assert!(t.lookup("shlwapi.dll", "PathFindExtensionW").is_some());
+        assert!(t.lookup("shlwapi.dll", "PathRemoveFileSpecW").is_some());
+        assert!(t.lookup("shlwapi.dll", "PathAppendW").is_some());
+        assert!(t.lookup("shlwapi.dll", "PathCombineW").is_some());
+        assert!(t.lookup("shlwapi.dll", "PathIsRelativeW").is_some());
+        assert!(t.lookup("shlwapi.dll", "StrCmpIW").is_some());
+        assert!(t.lookup("shlwapi.dll", "StrStrW").is_some());
+        assert!(t.lookup("shlwapi.dll", "StrStrIW").is_some());
+        assert!(t.lookup("shlwapi.dll", "StrRStrIW").is_some());
+        assert!(t.lookup("shlwapi.dll", "wnsprintfW").is_some());
+        assert!(t.lookup("shlwapi.dll", "wnsprintfA").is_some());
+    }
+
+    #[test]
+    fn build_table_resolves_shell32_and_shlwapi_thunks() {
+        // The real-loader path must produce thunk pointers (distinct from raw fn ptrs).
+        let mut arena = ThunkArena::new().expect("arena");
+        let t = ImplTable::build(&mut arena);
+        let p = t
+            .lookup("shell32.dll", "ShellExecuteW")
+            .expect("ShellExecuteW resolved");
+        let raw = nigg_win32_kernel32::shell32::shell_execute_w as FnPtr;
+        assert_ne!(p, raw, "build() wraps shell32 impls in trampolines");
+        let p2 = t
+            .lookup("shlwapi.dll", "PathCombineW")
+            .expect("PathCombineW resolved");
+        let raw2 = nigg_win32_kernel32::shlwapi::path_combine_w as FnPtr;
+        assert_ne!(p2, raw2, "build() wraps shlwapi impls in trampolines");
+    }
+
+    #[test]
+    fn default_table_resolves_ucrt_exports() {
+        let t = ImplTable::default_table();
+        // Startup/init surface the UCRT boot sequence calls.
+        assert!(t.lookup("ucrtbase.dll", "_configure_narrow_argv").is_some());
+        assert!(t
+            .lookup("ucrtbase.dll", "_initialize_narrow_environment")
+            .is_some());
+        assert!(t.lookup("ucrtbase.dll", "__p___argc").is_some());
+        assert!(t.lookup("ucrtbase.dll", "__p___argv").is_some());
+        assert!(t.lookup("ucrtbase.dll", "__acrt_iob_func").is_some());
+        assert!(t.lookup("ucrtbase.dll", "_errno").is_some());
+        // Memory + string family overlap with msvcrt but live under ucrtbase.dll too.
+        assert!(t.lookup("ucrtbase.dll", "malloc").is_some());
+        assert!(t.lookup("ucrtbase.dll", "free").is_some());
+        assert!(t.lookup("ucrtbase.dll", "strlen").is_some());
+        assert!(t.lookup("ucrtbase.dll", "exit").is_some());
+        assert!(t.lookup("ucrtbase.dll", "wcschr").is_some());
+        // Unknown ucrt symbol still resolves to None (stubbed at load time).
+        assert!(t.lookup("ucrtbase.dll", "DefinitelyNotReal").is_none());
+    }
+
+    #[test]
+    fn default_table_resolves_registry_exports() {
+        let t = ImplTable::default_table();
+        assert!(t.lookup("advapi32.dll", "RegOpenKeyW").is_some());
+        assert!(t.lookup("advapi32.dll", "RegOpenKeyExW").is_some());
+        assert!(t.lookup("advapi32.dll", "RegCreateKeyExW").is_some());
+        assert!(t.lookup("advapi32.dll", "RegCloseKey").is_some());
+        assert!(t.lookup("advapi32.dll", "RegQueryValueExW").is_some());
+        assert!(t.lookup("advapi32.dll", "RegSetValueExW").is_some());
+        assert!(t.lookup("advapi32.dll", "RegEnumKeyW").is_some());
+        assert!(t.lookup("advapi32.dll", "RegEnumValueW").is_some());
+        assert!(t.lookup("advapi32.dll", "RegDeleteKeyW").is_some());
+        assert!(t.lookup("advapi32.dll", "IsTextUnicode").is_some());
+        // Unknown advapi32 symbol still resolves to None.
+        assert!(t.lookup("advapi32.dll", "DefinitelyNotReal").is_none());
+    }
+
+    #[test]
+    fn build_table_resolves_ucrt_and_registry_thunks() {
+        // The real-loader path must produce thunk pointers (distinct from raw fn ptrs).
+        let mut arena = ThunkArena::new().expect("arena");
+        let t = ImplTable::build(&mut arena);
+        let p = t
+            .lookup("ucrtbase.dll", "exit")
+            .expect("ucrtbase exit resolved");
+        let raw = nigg_win32_kernel32::ucrt::exit as FnPtr;
+        assert_ne!(p, raw, "build() wraps ucrt impls in trampolines");
+        let p2 = t
+            .lookup("advapi32.dll", "RegCreateKeyExW")
+            .expect("advapi32 RegCreateKeyExW resolved");
+        let raw2 = nigg_win32_kernel32::registry::reg_create_key_ex_w as FnPtr;
+        assert_ne!(p2, raw2, "build() wraps registry impls in trampolines");
     }
 }

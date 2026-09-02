@@ -38,6 +38,7 @@
 
 use std::os::raw::c_void;
 
+pub mod anticheat;
 pub mod console;
 pub mod crt;
 pub mod env;
@@ -45,7 +46,11 @@ pub mod extras;
 pub mod file;
 pub mod heap;
 pub mod process;
+pub mod registry;
+pub mod shell32;
+pub mod shlwapi;
 pub mod string;
+pub mod ucrt;
 
 /// A Windows `HANDLE`: an opaque, process-local 64-bit value (re-exported from ntapi).
 pub type Handle = u64;
