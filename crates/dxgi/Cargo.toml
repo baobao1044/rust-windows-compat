@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ash.workspace = true
+nigg-wsi.workspace = true
+log.workspace = true
+thiserror.workspace = true

@@ -5,3 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ash.workspace = true
+nigg-dxgi = { path = "../dxgi" }
+nigg-hlsl-compiler = { path = "../hlsl-compiler" }
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+nigg-wsi.workspace = true
+
+[[example]]
+name = "clear_triangle"
