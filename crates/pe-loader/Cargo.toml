@@ -8,9 +8,15 @@ license.workspace = true
 goblin.workspace = true
 pelite.workspace = true
 memmap2.workspace = true
+libc.workspace = true
 thiserror.workspace = true
 log.workspace = true
+env_logger.workspace = true
 clap.workspace = true
+nigg-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+nigg-tests-fixtures = { path = "../../tests/fixtures" }
 
 [lib]
 name = "nigg_pe_loader"

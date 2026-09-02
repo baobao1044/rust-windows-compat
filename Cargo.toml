@@ -49,6 +49,9 @@ pipewire = "0.8"
 rspirv = "0.12"
 spirv-tools = { version = "0.11", default-features = false }
 
+# Linux syscall / POSIX bindings (host binding, not Windows-compat code)
+libc = "0.2"
+
 # General
 log = "0.4"
 env_logger = "0.11"
