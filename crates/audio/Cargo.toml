@@ -4,4 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The default build is a no-op (`NullSink`) so the crate compiles with **no**
+# system audio packages. Enabling the real backends pulls system headers:
+#   - `cpal`     needs `libasound2-dev` (ALSA) — `alsa.pc` must be on the pkg-config
+#                path.
+#   - `pipewire` needs `libpipewire-0.3-dev` (PipeWire 0.3 headers).
+default = []
+
+# cpal (ALSA) audio sink.
+cpal = ["dep:cpal"]
+# PipeWire audio sink. Requires `libpipewire-0.3-dev` to enable.
+pipewire = ["dep:pipewire"]
+
 [dependencies]
+cpal = { workspace = true, optional = true }
+pipewire = { workspace = true, optional = true }
+log.workspace = true
+thiserror.workspace = true
