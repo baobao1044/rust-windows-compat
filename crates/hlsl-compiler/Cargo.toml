@@ -8,6 +8,7 @@ license.workspace = true
 rspirv.workspace = true
 thiserror.workspace = true
 log.workspace = true
+env_logger.workspace = true
 clap.workspace = true
 
 [lib]
