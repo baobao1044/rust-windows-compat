@@ -16,6 +16,7 @@ this project's test harness. Empty cells mean not-yet-reached.
 | D3D11 sample via nigg-loader (PE) | ✅ M7c | COM vtable for D3D11/DXGI — d3d11_sample.exe + d3d11_triangle.exe both run through nigg-loader, exit 0 |
 | Win32 GUI + D3D11 (game-window PE) | ✅ M7+ | RegisterClassExW + CreateWindowExW + D3D11CreateDeviceAndSwapChain (with HWND) + ClearRenderTargetView + Present + PeekMessageW — game_window.exe exits 0 |
 | Real Windows app (notepad.exe) | ✅ M7+ | Real Windows x64 PE — 92 imports all resolved (0 stubs), survives CRT init + enters message loop |
+| Game-like PE (system-integrity + D3D11) | ✅ M9d | Anti-cheat simulation + D3D11 clear+present in a single fixture — game_visual.exe exits 0 via nigg-loader (debugger/module/SecureBoot checks pass, then D3D11 pipeline) |
 | D3D11 indie game | — | M7 |
 | D3D12 clear-screen (Rust-native) | ✅ M8 | D3D12 → Vulkan: Device, CommandQueue, CommandList, DescriptorHeap, Resource, PipelineState, RootSignature — clear-screen test exercises real Vulkan path end-to-end |
 | D3D12 sample via nigg-loader (PE) | ✅ M8b | COM vtable for D3D12 — d3d12_sample.exe runs full command-list pipeline through nigg-loader, exit 0 |
