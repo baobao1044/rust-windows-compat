@@ -225,6 +225,11 @@ fn search_dirs() -> Vec<PathBuf> {
 /// export directory. Returns the export's Win64 code address, or NULL + last error
 /// 127 (`ERROR_PROC_NOT_FOUND`).
 pub extern "C" fn get_proc_address(h_module: *mut c_void, name: *const u8) -> *mut c_void {
+    log::trace!(
+        "kernel32!GetProcAddress(h={:#x}, name={:#x})",
+        h_module as usize,
+        name as usize
+    );
     if h_module.is_null() {
         set_last_error(ERROR_PROC_NOT_FOUND);
         return std::ptr::null_mut();

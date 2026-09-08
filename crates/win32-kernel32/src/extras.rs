@@ -326,10 +326,10 @@ pub extern "C" fn switch_to_thread() -> i32 {
     1
 }
 
-/// `kernel32!GetProcAddress(hModule, name) -> FARPROC`. Returns NULL.
-pub extern "C" fn get_proc_address(_module: *mut c_void, _name: *const u8) -> *mut c_void {
-    std::ptr::null_mut()
-}
+// `kernel32!GetProcAddress` is *not* registered here: the canonical (real)
+// implementation lives in `crate::dllload` and is referenced by `anticheat`'s export
+// list — a second, stub registration in this table would win the loader's first-wins
+// dedup and leave DLL exports permanently unresolvable.
 
 // ---------------------------------------------------------------------------
 // One-time init
@@ -882,7 +882,8 @@ pub fn extra_export_specs() -> Vec<ExtraSpec> {
             1
         ),
         e!("kernel32.dll", "SwitchToThread", switch_to_thread, 0),
-        e!("kernel32.dll", "GetProcAddress", get_proc_address, 2),
+        // `GetProcAddress` is registered by `anticheat` (-> `crate::dllload`); see the
+        // note above.
         // --- kernel32: one-time init ---
         e!(
             "kernel32.dll",
