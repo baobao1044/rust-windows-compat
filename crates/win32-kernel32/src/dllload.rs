@@ -247,7 +247,8 @@ pub extern "C" fn get_proc_address(h_module: *mut c_void, name: *const u8) -> *m
 }
 
 /// `kernel32!FreeLibrary(hModule) -> BOOL`. Unloads a registered module. Windows
-/// ref-counts repeated loads; we do not, so the first `FreeLibrary` unmarks the module.
+/// ref-counts repeated loads; we do not, so the first `FreeLibrary` unregisters the
+/// module (releasing its mapping and the stack/thunk arena attached at load time).
 pub extern "C" fn free_library(h_module: *mut c_void) -> c_int {
     let Some(func) = FREE_LIBRARY_FN.get() else {
         log::warn!("FreeLibrary requested but no module registry is registered");

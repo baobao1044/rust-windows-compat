@@ -569,3 +569,85 @@ fn nigg_loader_runs_tpm_secureboot_sim_and_exits_0() {
         }
     }
 }
+
+/// Locate the cross-compiled `dllload_test.exe` **and** its companion `nigg_dllload.dll`
+/// (a standalone workspace under `tests/dllload-test`). Returns `None` when either has
+/// not been built yet.
+fn dllload_fixture() -> Option<(PathBuf, PathBuf)> {
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("tests/dllload-test/target"));
+    let dir = target_dir.join("x86_64-pc-windows-gnu").join("debug");
+    let exe = dir.join("dllload_test.exe");
+    let dll = dir.join("nigg_dllload.dll");
+    if exe.exists() && dll.exists() {
+        Some((exe, dll))
+    } else {
+        None
+    }
+}
+
+/// M9-DLLLOAD acceptance test: the DLL-loading fixture PE must run end-to-end through
+/// `nigg-loader` and exit 0. This validates the whole runtime DLL pipeline:
+///
+/// 1. `kernel32!LoadLibraryA("nigg_dllload.dll")` — the loader searches the process
+///    working directory (set to the fixture's target dir), maps the DLL at a
+///    kernel-chosen base, applies its base relocations (DIR64/HIGHLOW semantics —
+///    mandatory at a relocated base), resolves its imports through the same
+///    Win64->SysV thunk surface as the main image, and runs
+///    `DllMain(hModule, DLL_PROCESS_ATTACH, NULL)` on a fresh guest stack (the mingw
+///    CRT's `_CRT_INIT` runs, including the `gs`-based TEB reads and the process heap).
+/// 2. `kernel32!GetProcAddress(h, "dll_increment"/"dll_count")` walks the DLL's *real*
+///    export directory (read back from the relocated mapped image) and returns the
+///    native Win64 code addresses; a missing export ("dll_absent") resolves to NULL.
+/// 3. The EXE calls the resolved export directly (both sides use the Windows x64 ABI,
+///    so no trampoline is involved) and verifies the DLL's internal atomic counter
+///    advanced by exactly one, then `FreeLibrary` unloads the module (`TRUE`).
+///
+/// The test runs the loader with the fixture DLL's directory as the working directory
+/// so the bare-name search ("nigg_dllload.dll") resolves to the cwd, mirroring the
+/// Windows search-path default.
+///
+/// The test skips (passing) if the fixtures have not been cross-compiled. Build them
+/// with:
+///   cargo build --target x86_64-pc-windows-gnu --manifest-path tests/dllload-test/Cargo.toml
+#[test]
+fn nigg_loader_runs_dllload_test_and_exits_0() {
+    let (exe_path, dll_path) = match dllload_fixture() {
+        Some(pair) => pair,
+        None => {
+            eprintln!(
+                "nigg-loader: skipping nigg_loader_runs_dllload_test_and_exits_0 — \
+                 dllload_test.exe / nigg_dllload.dll not built. Build them with: \
+                 `cargo build --target x86_64-pc-windows-gnu --manifest-path \
+                 tests/dllload-test/Cargo.toml`."
+            );
+            return;
+        }
+    };
+
+    // The fixture loads its DLL by bare name, so the loader's DLL search must find the
+    // sibling file: run with the fixture's target dir as the working directory.
+    let working_dir = dll_path
+        .parent()
+        .expect("DLL fixture has a parent dir")
+        .to_path_buf();
+    let output = Command::new(BIN)
+        .arg(&exe_path)
+        .current_dir(&working_dir)
+        .output()
+        .expect("run nigg-loader");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    match output.status.code() {
+        Some(0) => {}
+        other => {
+            panic!(
+                "nigg-loader must exit 0 for the DLL-loading fixture PE (got {other:?})\n\
+                 stdout={stdout}\nstderr={stderr}"
+            );
+        }
+    }
+}

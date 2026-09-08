@@ -444,7 +444,6 @@ fn unprotect_span(
     span: usize,
     page: usize,
 ) -> (usize, usize, c_int) {
-    let addr = addr as usize;
     let start = addr & !(page - 1);
     let end = round_up(addr + span, page);
     let len = end - start;
@@ -487,8 +486,9 @@ fn apply_one_reloc(target: *mut u8, typ: u16, delta: i64) -> Result<(), MapError
         // IMAGE_REL_BASED_DIR64: 64-bit absolute address — patch `+= delta`.
         10 => {
             // SAFETY: `target..target+8` is within the mapped image (validated by
-            // rva_to_ptr) and is writable while relocations are applied (before the
-            // section permissions downgrade). Read-modify-write a little-endian u64.
+            // rva_to_ptr) and its page is currently writable — the caller in
+            // `apply_relocations` flips the page RW for every patch (section
+            // permissions alone would have left .rdata pages read-only).
             let old = unsafe { std::ptr::read_unaligned(target as *const u64) };
             let new = (old as i64).wrapping_add(delta) as u64;
             unsafe { std::ptr::write_unaligned(target as *mut u64, new) };

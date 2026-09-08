@@ -83,6 +83,21 @@ pub extern "C" fn free(ptr: *mut c_void) {
     crate::heap::heap_free(crate::heap::get_process_heap(), 0, ptr);
 }
 
+/// `msvcrt!realloc(void*, size_t) -> void*`. Grows/shrinks an allocation, moving it if
+/// needed; `realloc(NULL, n)` is `malloc(n)` and `realloc(p, 0)` frees `p` (returning
+/// NULL). Delegates to `crate::heap::heap_re_alloc` on the process heap so CRT
+/// allocations stay interchangeable with `HeapAlloc`/`HeapFree`.
+pub extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+    if ptr.is_null() {
+        return crate::heap::heap_alloc(crate::heap::get_process_heap(), 0, size);
+    }
+    if size == 0 {
+        crate::heap::heap_free(crate::heap::get_process_heap(), 0, ptr);
+        return std::ptr::null_mut();
+    }
+    crate::heap::heap_re_alloc(crate::heap::get_process_heap(), 0, ptr, size)
+}
+
 // ---------------------------------------------------------------------------
 // String
 // ---------------------------------------------------------------------------
@@ -437,6 +452,7 @@ pub fn crt_export_specs() -> Vec<CrtSpec> {
         // memory
         c!("malloc", malloc, 1),
         c!("calloc", calloc, 2),
+        c!("realloc", realloc, 2),
         c!("free", free, 1),
         // string
         c!("strlen", strlen, 1),
