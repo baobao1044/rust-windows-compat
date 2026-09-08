@@ -504,3 +504,68 @@ fn nigg_loader_runs_game_visual_and_exits_0() {
         }
     }
 }
+
+/// Locate the cross-compiled `tpm_secureboot_sim.exe` (a standalone workspace
+/// under `tests/tpm-secureboot-sim`). Returns `None` when it has not been built.
+fn tpm_secureboot_sim_exe() -> Option<PathBuf> {
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("tests/tpm-secureboot-sim/target"));
+    let exe = target_dir
+        .join("x86_64-pc-windows-gnu")
+        .join("debug")
+        .join("tpm_secureboot_sim.exe");
+    if exe.exists() {
+        Some(exe)
+    } else {
+        None
+    }
+}
+
+/// TPM 2.0 / Secure Boot acceptance test: the system-integrity simulation PE
+/// must run through nigg-loader and exit 0. This validates the Windows 11-era
+/// platform-trust surface end-to-end through the Win64→SysV ABI thunk layer:
+/// `GetFirmwareType` (UEFI), `GetFirmwareEnvironmentVariableA` (the SecureBoot
+/// EFI variable = 1), `tbs.dll` TPM 2.0 context + version + command probes
+/// (`TPM_VERSION_20`), the advapi32 secure-boot status probes, the not-WOW64 /
+/// product-type checks, and the seeded Secure Boot registry state
+/// (`UEFISecureBootEnabled = 1`).
+#[test]
+fn nigg_loader_runs_tpm_secureboot_sim_and_exits_0() {
+    let exe_path = match tpm_secureboot_sim_exe() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "nigg-loader: skipping nigg_loader_runs_tpm_secureboot_sim_and_exits_0 — \
+                 tpm_secureboot_sim.exe not built. Build it with: \
+                 `cargo build --target x86_64-pc-windows-gnu --manifest-path \
+                 tests/tpm-secureboot-sim/Cargo.toml`."
+            );
+            return;
+        }
+    };
+
+    let output = Command::new(BIN)
+        .arg(&exe_path)
+        .output()
+        .expect("run nigg-loader");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    match output.status.code() {
+        Some(0) => {}
+        Some(code @ 125) => {
+            eprintln!(
+                "nigg-loader: skipping tpm_secureboot_sim — loader runtime error, \
+                 exit {code}.\nstdout={stdout}\nstderr={stderr}"
+            );
+        }
+        other => {
+            panic!(
+                "nigg-loader must exit 0 for the TPM/Secure Boot sim PE (got {other:?})\n\
+                 stdout={stdout}\nstderr={stderr}"
+            );
+        }
+    }
+}

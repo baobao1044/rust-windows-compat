@@ -54,6 +54,9 @@ const ERROR_FILE_NOT_FOUND: i32 = 2;
 const ERROR_NO_MORE_ITEMS: i32 = 259;
 /// `ERROR_INVALID_HANDLE` (6) — returned when the parent handle is neither a root nor open.
 const ERROR_INVALID_HANDLE: i32 = 6;
+/// `ERROR_CALL_NOT_IMPLEMENTED` (120) — returned by registry entry points our
+/// in-memory store cannot honor (e.g. the custom-key-handler resolver).
+const ERROR_CALL_NOT_IMPLEMENTED: i32 = 120;
 
 /// `REG_CREATED_NEW_KEY` (1) — disposition written by `RegCreateKeyExW` for a new key.
 const REG_CREATED_NEW_KEY: u32 = 1;
@@ -435,6 +438,148 @@ pub extern "C" fn is_text_unicode(
     0 // FALSE
 }
 
+/// `advapi32!RegQueryInfoKeyW(HKEY, LPWSTR lpClass, LPDWORD lpcchClass,
+/// LPDWORD lpReserved, LPDWORD lpcSubKeys, LPDWORD lpcbMaxSubKeyLen,
+/// LPDWORD lpcchMaxClassLen, LPDWORD lpcValues, LPDWORD lpcchMaxValueNameLen,
+/// LPDWORD lpcbMaxValueLen, LPDWORD lpcbSecurityDescriptor,
+/// PFILETIME lpftLastWriteTime) -> LSTATUS`.
+///
+/// Reports the live shape of the in-memory key: direct-subkey count and max
+/// subkey-name length (in UTF-16 chars, NUL excluded) from the full-path map,
+/// value count and max value-name length from the key's stored values. The
+/// class is empty (zero), max value data length and security-descriptor size
+/// are 0, and the last-write time is 0. Unknown handles get
+/// `ERROR_INVALID_HANDLE`.
+pub extern "C" fn reg_query_info_key_w(
+    hkey: Handle,
+    class: *mut u16,
+    class_len: *mut u32,
+    _reserved: *mut u32,
+    sub_keys: *mut u32,
+    max_subkey_len: *mut u32,
+    max_class_len: *mut u32,
+    values: *mut u32,
+    max_value_name_len: *mut u32,
+    max_value_len: *mut u32,
+    sa_len: *mut u32,
+    last_write: *mut u64,
+) -> i32 {
+    let Some(path) = resolve_path(hkey) else {
+        return ERROR_INVALID_HANDLE;
+    };
+
+    // Direct subkeys: full-path entries exactly one component deeper.
+    let (subkey_count, max_subkey_chars) = {
+        let g = registry().lock();
+        let prefix = format!("{path}\\");
+        let mut count = 0u32;
+        let mut max_chars = 0usize;
+        for key_path in g.keys.keys() {
+            if let Some(rest) = key_path.strip_prefix(&prefix) {
+                if !rest.is_empty() && !rest.contains('\\') {
+                    count += 1;
+                    max_chars = max_chars.max(rest.encode_utf16().count());
+                }
+            }
+        }
+        (count, max_chars)
+    };
+
+    // Stored values on the key itself.
+    let (value_count, max_value_name_chars) = {
+        let g = registry().lock();
+        match g.keys.get(&path) {
+            Some(key) => (
+                key.values.len() as u32,
+                key.values
+                    .keys()
+                    .map(|n| n.encode_utf16().count())
+                    .max()
+                    .unwrap_or(0),
+            ),
+            None => (0, 0),
+        }
+    };
+
+    if !class.is_null() {
+        // SAFETY: `class` is a writable guest buffer with room for at least one
+        // code unit (guaranteed when lpcchClass is queried successfully); write
+        // just the terminator for our (empty) class string.
+        unsafe { std::ptr::write_unaligned(class, 0) };
+    }
+    if !class_len.is_null() {
+        // SAFETY: `class_len` is a guest out-pointer valid for one `DWORD`.
+        unsafe { std::ptr::write_unaligned(class_len, 0) };
+    }
+    if !sub_keys.is_null() {
+        // SAFETY: `sub_keys` is a guest out-pointer valid for one `DWORD`.
+        unsafe { std::ptr::write_unaligned(sub_keys, subkey_count) };
+    }
+    if !max_subkey_len.is_null() {
+        // SAFETY: `max_subkey_len` is a guest out-pointer valid for one `DWORD`.
+        unsafe { std::ptr::write_unaligned(max_subkey_len, max_subkey_chars as u32) };
+    }
+    if !max_class_len.is_null() {
+        // SAFETY: `max_class_len` is a guest out-pointer valid for one `DWORD`.
+        unsafe { std::ptr::write_unaligned(max_class_len, 0) };
+    }
+    if !values.is_null() {
+        // SAFETY: `values` is a guest out-pointer valid for one `DWORD`.
+        unsafe { std::ptr::write_unaligned(values, value_count) };
+    }
+    if !max_value_name_len.is_null() {
+        // SAFETY: `max_value_name_len` is a guest out-pointer valid for one `DWORD`.
+        unsafe { std::ptr::write_unaligned(max_value_name_len, max_value_name_chars as u32) };
+    }
+    if !max_value_len.is_null() {
+        // SAFETY: `max_value_len` is a guest out-pointer valid for one `DWORD`.
+        unsafe { std::ptr::write_unaligned(max_value_len, 0) };
+    }
+    if !sa_len.is_null() {
+        // SAFETY: `sa_len` is a guest out-pointer valid for one `DWORD`.
+        unsafe { std::ptr::write_unaligned(sa_len, 0) };
+    }
+    if !last_write.is_null() {
+        // SAFETY: `last_write` is a guest out-pointer valid for one `FILETIME`.
+        unsafe { std::ptr::write_unaligned(last_write, 0) };
+    }
+    ERROR_SUCCESS
+}
+
+/// `advapi32!RegDeleteTreeW(HKEY, LPCWSTR lpSubKey) -> LSTATUS`.
+///
+/// Deletes the key at `hKey\lpSubKey` and every stored key below it.
+/// Returns `ERROR_SUCCESS` when something was removed, `ERROR_FILE_NOT_FOUND`
+/// when the base key is absent, `ERROR_INVALID_HANDLE` for an unknown parent.
+pub extern "C" fn reg_delete_tree_w(hkey: Handle, subkey: *const u16) -> i32 {
+    let base = match build_path(hkey, subkey) {
+        Some(p) => p,
+        None => return ERROR_INVALID_HANDLE,
+    };
+    let child_prefix = format!("{base}\\");
+    let mut g = registry().lock();
+    let existed = g.keys.remove(&base).is_some();
+    g.keys.retain(|path, _key| !path.starts_with(&child_prefix));
+    if existed {
+        ERROR_SUCCESS
+    } else {
+        ERROR_FILE_NOT_FOUND
+    }
+}
+
+/// `advapi32!RegResolveCustomKeyHandler(HKEY, LPCWSTR, void**) -> LSTATUS` (stub).
+///
+/// The in-memory registry has no custom-key-handler indirection to resolve;
+/// reports `ERROR_CALL_NOT_IMPLEMENTED` so callers take their not-supported
+/// fallback (we deliberately never hand back an uninitialized handler pointer).
+pub extern "C" fn reg_resolve_custom_key_handler(
+    _hkey: Handle,
+    _name: *const u16,
+    _handler: *mut *mut std::ffi::c_void,
+) -> i32 {
+    ERROR_CALL_NOT_IMPLEMENTED
+}
+
 /// Resolve the full path bound to `hkey`, or `None` if it is neither a root nor a known
 /// open handle. Holds the registry lock; callers must not already hold it.
 fn resolve_path(hkey: Handle) -> Option<String> {
@@ -443,6 +588,19 @@ fn resolve_path(hkey: Handle) -> Option<String> {
     }
     let g = registry().lock();
     g.handles.get(&hkey).cloned()
+}
+
+/// Insert (or overwrite) a value under an existing-or-lazy-created key by its
+/// full path. Crate-internal helper used by the [`crate::spi`] security-policy
+/// seeding and by unit tests; callers of the wire-level `RegSet*` exports keep
+/// going through handles.
+pub(crate) fn put_value(path: &str, name: &str, reg_type: u32, data: Vec<u8>) {
+    let mut g = registry().lock();
+    g.keys
+        .entry(path.to_string())
+        .or_default()
+        .values
+        .insert(name.to_string(), RegValue { reg_type, data });
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +642,13 @@ pub fn registry_exports() -> Vec<RegistrySpec> {
         r!("RegEnumKeyW", reg_enum_key_w, 4),
         r!("RegEnumValueW", reg_enum_value_w, 8),
         r!("RegDeleteKeyW", reg_delete_key_w, 2),
+        r!("RegQueryInfoKeyW", reg_query_info_key_w, 12),
+        r!("RegDeleteTreeW", reg_delete_tree_w, 2),
+        r!(
+            "RegResolveCustomKeyHandler",
+            reg_resolve_custom_key_handler,
+            3
+        ),
         r!("IsTextUnicode", is_text_unicode, 3),
     ]
 }
@@ -731,6 +896,143 @@ mod tests {
             reg_delete_key_w(HKEY_LOCAL_MACHINE, sub.as_ptr()),
             ERROR_FILE_NOT_FOUND
         );
+    }
+
+    #[test]
+    fn query_info_key_counts_subkeys_and_values() {
+        let base = wstr("Software\\nigg-info");
+        let child = wstr("Software\\nigg-info\\dotty");
+        let mut h: Handle = 0;
+        let mut h2: Handle = 0;
+        let mut disp: u32 = 0;
+        reg_create_key_ex_w(
+            HKEY_LOCAL_MACHINE,
+            base.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+            std::ptr::null_mut(),
+            &mut h,
+            &mut disp,
+        );
+        reg_create_key_ex_w(
+            HKEY_LOCAL_MACHINE,
+            child.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+            std::ptr::null_mut(),
+            &mut h2,
+            &mut disp,
+        );
+        let name = wstr("Val");
+        let payload = [1u8, 0, 0, 0];
+        reg_set_value_ex_w(h, name.as_ptr(), 0, 4, payload.as_ptr(), 4);
+
+        let mut sub_count: u32 = 0;
+        let mut max_subkey: u32 = 0;
+        let mut val_count: u32 = 0;
+        let mut max_value_name: u32 = 0;
+        let mut last_write: u64 = 0xAA;
+        assert_eq!(
+            reg_query_info_key_w(
+                h,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sub_count,
+                &mut max_subkey,
+                std::ptr::null_mut(),
+                &mut val_count,
+                &mut max_value_name,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut last_write,
+            ),
+            ERROR_SUCCESS
+        );
+        assert_eq!(sub_count, 1, "one direct child (nigg-info\\dotty)");
+        assert_eq!(max_subkey, 5, "subkey \"dotty\" is 5 UTF-16 chars");
+        assert_eq!(val_count, 1);
+        assert_eq!(max_value_name, 3, "\"Val\" is 3 UTF-16 chars");
+        assert_eq!(last_write, 0, "no last-write time is modeled");
+
+        // Unknown handle is rejected.
+        assert_eq!(
+            reg_query_info_key_w(
+                0xDEAD,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            ERROR_INVALID_HANDLE
+        );
+        reg_close_key(h);
+        reg_close_key(h2);
+    }
+
+    #[test]
+    fn delete_tree_removes_subtree() {
+        let base = wstr("Software\\nigg-tree");
+        let child = wstr("Software\\nigg-tree\\leaf");
+        let grandchild = wstr("Software\\nigg-tree\\leaf\\twig");
+        let unrelated = wstr("Software\\nigg-tree-2");
+        let mut h: Handle = 0;
+        let mut disp: u32 = 0;
+        for sub in [&base, &child, &grandchild, &unrelated] {
+            reg_create_key_ex_w(
+                HKEY_LOCAL_MACHINE,
+                sub.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                &mut h,
+                &mut disp,
+            );
+        }
+        assert_eq!(
+            reg_delete_tree_w(HKEY_LOCAL_MACHINE, base.as_ptr()),
+            ERROR_SUCCESS
+        );
+        // The subtree (base, child, grandchild) is gone...
+        for sub in [&base, &child, &grandchild] {
+            assert_eq!(
+                reg_delete_key_w(HKEY_LOCAL_MACHINE, sub.as_ptr()),
+                ERROR_FILE_NOT_FOUND
+            );
+        }
+        // ...but the sibling key survives.
+        assert_eq!(
+            reg_delete_key_w(HKEY_LOCAL_MACHINE, unrelated.as_ptr()),
+            ERROR_SUCCESS
+        );
+        // Deleting again -> not found.
+        assert_eq!(
+            reg_delete_tree_w(HKEY_LOCAL_MACHINE, base.as_ptr()),
+            ERROR_FILE_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn custom_key_handler_resolver_reports_not_implemented() {
+        let mut handler: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert_eq!(
+            reg_resolve_custom_key_handler(HKEY_LOCAL_MACHINE, std::ptr::null(), &mut handler),
+            120 // ERROR_CALL_NOT_IMPLEMENTED
+        );
+        assert!(handler.is_null(), "no fake handler is returned");
     }
 
     #[test]

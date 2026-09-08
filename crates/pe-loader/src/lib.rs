@@ -14,14 +14,23 @@
 //! 5. Builds a minimal TEB and PEB so `gs:[...]` reads (the Windows TIB/TEB fields) work.
 //! 6. Runs the entrypoint on a fresh stack with the `gs` base set, returning the exit code.
 //!
+//! Beyond the main image, [`load_dll`] loads `LoadLibrary`-style DLLs at
+//! runtime: the file is mapped at a kernel-chosen base (never colliding with a running
+//! image), relocated, import-resolved, initialized with `DllMain(hModule,
+//! DLL_PROCESS_ATTACH, NULL)`, and registered in the module list whose `HMODULE`s
+//! (image bases) are what `GetProcAddress` resolves exports against.
+//!
 //! `#![deny(unsafe_op_in_unsafe_fn)]` is enforced; every `unsafe` block has a SAFETY comment.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod dllmod;
 mod imports;
 mod mapping;
 mod teb;
 mod thunk;
+
+pub use dllmod::{free_library, get_proc_address, load_dll};
 
 use imports::{ImplTable, ResolvedImports};
 use mapping::{MapError, MappedImage};
@@ -119,6 +128,11 @@ pub fn load(path: &Path) -> Result<PeImage, LoadError> {
 
 /// Load and prepare a PE image from in-memory bytes (used by tests).
 pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
+    // Install the kernel32-side `LoadLibrary*`/`GetProcAddress`/`FreeLibrary` bridges so
+    // a running PE (and every `LoadLibrary`-loaded DLL) can load further DLLs at
+    // runtime. Idempotent: the registration uses `OnceLock`s, so repeated loads
+    // (including this one) are no-ops after the first.
+    dllmod::register_kernel32_bridge();
     let pe = goblin::pe::PE::parse(bytes)?;
     let opt = pe
         .header

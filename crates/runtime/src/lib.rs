@@ -314,6 +314,79 @@ pub unsafe fn run_entrypoint_win64(entry: *const (), stack_top: *mut u8, peb: *m
     result
 }
 
+/// Call a DLL's entrypoint (`DllMain` / `DllMainCRTStartup`) on `stack_top` with the
+/// **Windows x64 calling convention**, returning the value left in `eax` (the `BOOL`
+/// result: nonzero means the DLL initialized successfully).
+///
+/// `DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)` receives its
+/// arguments in `RCX / RDX / R8` per the Windows x64 ABI:
+///
+/// - `RCX = h_module` — the module handle (`HMODULE`), which under our loader is the
+///   mapped DLL image base address.
+/// - `RDX = reason`   — the DLL notification code (`DLL_PROCESS_ATTACH` = 1 on load).
+/// - `R8  = reserved` — context pointer (NULL for `DLL_PROCESS_ATTACH`).
+///
+/// The stack layout and alignment requirements are identical to
+/// [`run_entrypoint_win64`] (32-byte shadow space, `RSP` 16-aligned at the `call`). The
+/// fast-fail handler installation is shared with that function.
+///
+/// # Safety
+///
+/// `entry` must point to valid, executable, position-appropriate machine code (a mapped,
+/// relocated DLL entrypoint), and `stack_top` must be a valid, writable, 16-aligned stack
+/// pointer with at least 40 bytes of usable space below it. `h_module` must be a valid
+/// readable pointer if the entrypoint dereferences it (the loader supplies the image
+/// base). The caller upholds these by passing the DLL loader's resolved entrypoint and a
+/// freshly allocated [`Stack::top`].
+pub unsafe fn run_dll_main_win64(
+    entry: *const (),
+    stack_top: *mut u8,
+    h_module: *mut (),
+    reason: u32,
+    reserved: *mut (),
+) -> i32 {
+    install_fastfail_handler();
+
+    let mut result: i32;
+
+    // Mirrors the frame layout of `run_entrypoint_win64`: 32 bytes of shadow space above
+    // the `call`'s return address, r12 stashing the host RSP (callee-saved by the Win64
+    // ABI), and RAX returned as the `BOOL`.
+    //
+    // SAFETY: `entry` is a valid executable DLL entrypoint; `stack_top` is 16-aligned
+    // with ample usable space below it; `h_module`/`reserved` are live guest pointers.
+    // The inline asm only touches the argument registers and RSP; r12 is restored after
+    // the call (it survives the callee, which preserves it per the Windows ABI).
+    unsafe {
+        asm!(
+            "mov r12, rsp",
+            "mov rcx, {h_module}",
+            "mov edx, {reason:e}",
+
+            "mov r8, {reserved}",
+            "mov rsp, {sp}",
+            "sub rsp, 0x20",
+            "call {entry}",
+            "mov rsp, r12",
+            h_module = in(reg) h_module,
+            reason = in(reg) reason,
+            reserved = in(reg) reserved,
+            sp = in(reg) stack_top,
+            entry = in(reg) entry,
+            out("r12") _,
+            out("rax") result,
+            out("rcx") _,
+            out("rdx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+        );
+    }
+
+    result
+}
+
 #[derive(Debug)]
 pub enum BootstrapError {
     /// `arch_prctl(ARCH_SET_GS)` failed.

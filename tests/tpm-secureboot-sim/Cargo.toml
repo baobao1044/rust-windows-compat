@@ -1,0 +1,31 @@
+[package]
+name = "nigg-tpm-secureboot-sim"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# A PE that simulates the Windows 11-era system-integrity probes a game or
+# anti-cheat performs at startup, validating our compatibility layer's
+# TPM 2.0 / Secure Boot API surface end-to-end:
+# 1. Firmware type: GetFirmwareType -> FirmwareTypeUefi
+# 2. Secure Boot EFI variable: GetFirmwareEnvironmentVariableA("SecureBoot", EFI namespace)
+# 3. TPM 2.0 Base Services: Tbsi_Context_Create + Tbsi_Context_GetTpmVersion
+# 4. advapi32 secure-boot status: IsSecureBootEnabled / SystemSecureBootEnabled
+# 5. Native 64-bit check: IsWow64Process
+# 6. Windows edition: GetProductInfo -> PRODUCT_PROFESSIONAL
+# 7. TPM command probe: Tbsip_Submit_Command + Tbsi_Get_TCG_Log + Tbsip_Context_Close
+# 8. Secure Boot registry state: RegOpenKeyExW + RegQueryValueExW
+# 9. ExitProcess(0)
+
+[[bin]]
+name = "tpm_secureboot_sim"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]

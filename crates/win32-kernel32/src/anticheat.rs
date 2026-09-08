@@ -15,6 +15,7 @@
 use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::dllload;
 use crate::ExportSpec;
 
 /// `ERROR_SUCCESS` = 0.
@@ -690,14 +691,47 @@ pub fn anticheat_exports() -> Vec<ExportSpec> {
             n_args: 3,
             noreturn: false,
         },
+        // System-security probes (Windows 11-era games check the platform
+        // looks like a real UEFI/TPM 2.0 machine before trusting it). The
+        // implementations live in `tpm` / `registry`; only the kernel32-facing
+        // views are registered here as well.
+        ExportSpec {
+            dll: "kernel32.dll",
+            sym: "GetFirmwareType",
+            ptr: crate::tpm::get_firmware_type as *const c_void,
+            n_args: 1,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "advapi32.dll",
+            sym: "IsSecureBootEnabled",
+            ptr: crate::tpm::is_secure_boot_enabled as *const c_void,
+            n_args: 0,
+            noreturn: false,
+        },
+        ExportSpec {
+            dll: "kernel32.dll",
+            sym: "IsTextUnicode",
+            ptr: crate::registry::is_text_unicode as *const c_void,
+            n_args: 3,
+            noreturn: false,
+        },
         // Spotify.exe + complex app stubs
         k!("EncodePointer", encode_pointer, 1),
-        k!("LoadLibraryA", load_library_a, 1),
-        k!("LoadLibraryW", load_library_w, 1),
-        k!("LoadLibraryExA", load_library_ex_a, 3),
-        k!("LoadLibraryExW", load_library_ex_w, 3),
-        k!("GetProcAddress", get_proc_address, 2),
-        k!("FreeLibrary", free_library, 1),
+        // The module-loading surface delegates to `dllload` (the real loader is
+        // registered there by `nigg-pe-loader` via a function-pointer bridge — kernel32
+        // cannot depend on the loader crate).
+        k!("LoadLibraryA", dllload::load_library_a, 1),
+        k!("LoadLibraryW", dllload::load_library_w, 1),
+        k!("LoadLibraryExA", dllload::load_library_ex_a, 3),
+        k!("LoadLibraryExW", dllload::load_library_ex_w, 3),
+        k!(
+            "DisableThreadLibraryCalls",
+            dllload::disable_thread_library_calls,
+            1
+        ),
+        k!("GetProcAddress", dllload::get_proc_address, 2),
+        k!("FreeLibrary", dllload::free_library, 1),
         k!("GetSystemTimeAsFileTime", get_system_time_as_file_time, 1),
         k!("CreateFileMappingW", create_file_mapping_w, 6),
         k!("MapViewOfFile", map_view_of_file, 5),
@@ -779,39 +813,10 @@ pub extern "C" fn encode_pointer(ptr: *mut c_void) -> *mut c_void {
     ptr
 }
 
-/// `kernel32!LoadLibraryA(name) -> HMODULE`. Returns NULL (can't load DLLs).
-pub extern "C" fn load_library_a(_name: *const u8) -> *mut c_void {
-    std::ptr::null_mut()
-}
-
-/// `kernel32!LoadLibraryW(name) -> HMODULE`. Returns NULL.
-pub extern "C" fn load_library_w(_name: *const u16) -> *mut c_void {
-    std::ptr::null_mut()
-}
-
-/// `kernel32!LoadLibraryExA(name, h, flags) -> HMODULE`. Returns NULL.
-pub extern "C" fn load_library_ex_a(_name: *const u8, _h: *mut c_void, _flags: u32) -> *mut c_void {
-    std::ptr::null_mut()
-}
-
-/// `kernel32!LoadLibraryExW(name, h, flags) -> HMODULE`. Returns NULL.
-pub extern "C" fn load_library_ex_w(
-    _name: *const u16,
-    _h: *mut c_void,
-    _flags: u32,
-) -> *mut c_void {
-    std::ptr::null_mut()
-}
-
-/// `kernel32!GetProcAddress(h, name) -> FARPROC`. Returns NULL.
-pub extern "C" fn get_proc_address(_h: *mut c_void, _name: *const u8) -> *mut c_void {
-    std::ptr::null_mut()
-}
-
-/// `kernel32!FreeLibrary(h) -> BOOL`. Returns TRUE.
-pub extern "C" fn free_library(_h: *mut c_void) -> c_int {
-    1
-}
+// The `LoadLibrary*`/`GetProcAddress`/`FreeLibrary` exports now live in
+// `crate::dllload` (referenced from the export table above); real DLL loading —
+// map a PE, run `DllMain(DLL_PROCESS_ATTACH)`, resolve exports — is implemented
+// by `nigg-pe-loader` and bridged through the function pointers in `dllload`.
 
 /// `kernel32!GetSystemTimeAsFileTime(lpFT)`. Fills with current time.
 pub extern "C" fn get_system_time_as_file_time(lp_ft: *mut u64) {

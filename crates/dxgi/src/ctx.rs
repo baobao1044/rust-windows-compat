@@ -6,15 +6,19 @@
 //! the D3D11 device and the immediate context can all share a single logical device
 //! (the D3D11 contract is one device driving one queue).
 //!
-//! # Headless operation
+//! # Surface paths
 //!
-//! The WSI layer currently hands back [`RawSurfaceHandle::None`](nigg_wsi::RawSurfaceHandle)
-//! from its pure-Rust X11 backend (no `xcb_connection_t*`), so a real `VkSurfaceKHR`
-//! cannot be built against an X11 window yet. Instead [`VkCtx`] requests the
-//! `VK_EXT_headless_surface` instance extension when it is available; the swap chain
-//! then creates a *headless* surface that needs no display server. `vkQueuePresentKHR`
-//! against a headless surface is well-defined (the presented images are simply not
-//! shown anywhere), which keeps the whole pipeline exercisable on a headless host.
+//! The instance is brought up with every windowing path the host loader advertises:
+//!
+//! - `VK_KHR_xcb_surface`: the real X11 present path — the swap chain turns the wsi
+//!   `(xcb_connection_t*, XID)` pair into a `VkSurfaceKHR` on the actual window.
+//!   Requested whenever the loader exposes it (it is harmless when unused, and the
+//!   instance has to be created with it *before* a window exists to present to).
+//! - `VK_EXT_headless_surface`: the no-display fallback for headless hosts, where
+//!   `vkQueuePresentKHR` is defined to succeed without showing anything.
+//!
+//! `VK_KHR_surface` is a dependency of both; it (plus `VK_KHR_swapchain` on the
+//! device) is requested whenever the loader has it.
 
 use ash::vk;
 use ash::{Entry, Instance};
@@ -42,6 +46,10 @@ pub struct VkCtx {
     /// `VK_KHR_surface` instance wrapper (used to destroy any surface, including
     /// headless).
     pub surface_ext: ash::khr::surface::Instance,
+    /// `VK_KHR_xcb_surface` instance wrapper, set when the extension was enabled on
+    /// the instance (host loader advertised it). A real X11 `VkSurfaceKHR` can only be
+    /// built when this is `Some`.
+    pub xcb_surface_ext: Option<ash::khr::xcb_surface::Instance>,
     /// `VK_KHR_swapchain` device wrapper (used to create/present the swap chain).
     pub swapchain_ext: ash::khr::swapchain::Device,
     /// `true` when `VK_EXT_headless_surface` was enabled on the instance.
@@ -80,6 +88,9 @@ impl VkCtx {
         let has_khr_surface = instance_exts
             .iter()
             .any(|ext| ext.extension_name_as_c_str() == Ok(vk::KHR_SURFACE_NAME));
+        let has_khr_xcb_surface = instance_exts
+            .iter()
+            .any(|ext| ext.extension_name_as_c_str() == Ok(vk::KHR_XCB_SURFACE_NAME));
 
         let mut enabled: Vec<&'static std::ffi::CStr> = Vec::new();
         if has_khr_surface {
@@ -87,6 +98,14 @@ impl VkCtx {
         }
         if has_headless_surface {
             enabled.push(vk::EXT_HEADLESS_SURFACE_NAME);
+        }
+        // The real X11 present path. Requires `VK_KHR_surface` (its dependency), so
+        // only request the pair together. Always-on when the loader has it: the
+        // instance must be created before a window exists, and requesting an unused
+        // surface extension is free.
+        let has_xcb_surface = has_khr_surface && has_khr_xcb_surface;
+        if has_xcb_surface {
+            enabled.push(vk::KHR_XCB_SURFACE_NAME);
         }
         let enabled_ptrs: Vec<*const std::os::raw::c_char> =
             enabled.iter().map(|n| n.as_ptr()).collect();
@@ -113,6 +132,11 @@ impl VkCtx {
         .map_err(|e| DxgiError::Vulkan(format!("create instance: {e}")))?;
 
         let surface_ext = ash::khr::surface::Instance::new(&entry, &instance);
+        let xcb_surface_ext = if has_xcb_surface {
+            Some(ash::khr::xcb_surface::Instance::new(&entry, &instance))
+        } else {
+            None
+        };
 
         // Pick a physical device with a graphics queue family.
         let physicals = unsafe {
@@ -166,6 +190,7 @@ impl VkCtx {
             device,
             graphics_queue,
             surface_ext,
+            xcb_surface_ext,
             swapchain_ext,
             has_headless_surface,
         })

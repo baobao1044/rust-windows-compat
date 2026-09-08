@@ -1,9 +1,8 @@
 //! X11 window backend implemented on top of `x11rb`.
 //!
-//! The backend owns a [`RustConnection`] — x11rb's pure-Rust X11 connection, which
-//! needs **no** system libraries at build time (unlike the libxcb-backed
-//! `XCBConnection`, which sits behind x11rb's `allow-unsafe-code` feature). It opens
-//! one top-level window, selects for the core event subset the rest of the
+//! The backend owns a [`XCBConnection`] — x11rb's libxcb-backed connection (built
+//! with the `allow-unsafe-code` feature, so it links against the system libxcb). It
+//! opens one top-level window, selects for the core event subset the rest of the
 //! compatibility layer cares about (expose, structure-notify, key, button, motion),
 //! and registers `WM_PROTOCOLS` / `WM_DELETE_WINDOW` so the close button turns into a
 //! [`WindowEvent::Close`] instead of killing the client.
@@ -11,13 +10,15 @@
 //! Events are drained non-blockingly from `poll_for_event`; the Win32 message loop
 //! above drives pacing, so we never sleep inside [`X11Window::poll_event`].
 //!
-//! # Raw surface handle (Phase 1)
+//! # Raw surface handle (dxgi present path)
 //!
-//! [`X11Window::raw_surface_handle`] returns [`RawSurfaceHandle::None`] for now. The
-//! pure-Rust connection has no `xcb_connection_t*` to hand Vulkan; the path to a real
-//! `VkSurfaceKHR` is to switch to x11rb's `XCBConnection` (enable the
-//! `allow-unsafe-code` feature, install `libxcb1-dev`), which exposes
-//! `get_raw_xcb_connection`. That is a Phase 2 concern for the dxgi workstream.
+//! Because the connection is libxcb-backed, [`X11Window::raw_surface_handle`] hands
+//! out a real [`RawSurfaceHandle::X11`]: the `xcb_connection_t*` (from
+//! `get_raw_xcb_connection`) plus the window XID. The dxgi swap chain turns that
+//! pair into a `VkSurfaceKHR` via `VK_KHR_xcb_surface`, so a win32-style PE opens a
+//! genuinely visible window with D3D11 rendering on it. The raw pointer is owned by
+//! the [`XCBConnection`] stored here, so the [`Window`](crate::Window) must outlive
+//! any surface (and swap chain) built from the handle.
 
 use x11rb::connection::Connection;
 use x11rb::errors::ConnectError;
@@ -26,7 +27,7 @@ use x11rb::protocol::xproto::{
     PropMode, WindowClass,
 };
 use x11rb::protocol::Event;
-use x11rb::rust_connection::RustConnection;
+use x11rb::xcb_ffi::XCBConnection;
 
 use crate::{MouseButton, RawSurfaceHandle, WindowEvent, WsiError};
 
@@ -43,7 +44,7 @@ const WM_DELETE_WINDOW: &[u8] = b"WM_DELETE_WINDOW";
 
 impl WmAtoms {
     /// Intern both atomids. Called once at window construction.
-    fn intern(conn: &RustConnection) -> Result<Self, WsiError> {
+    fn intern(conn: &XCBConnection) -> Result<Self, WsiError> {
         let wm_protocols = intern_atom(conn, WM_PROTOCOLS)?;
         let wm_delete_window = intern_atom(conn, WM_DELETE_WINDOW)?;
         Ok(Self {
@@ -54,7 +55,7 @@ impl WmAtoms {
 }
 
 /// Intern a single atom via the core protocol free function.
-fn intern_atom(conn: &RustConnection, name: &[u8]) -> Result<Atom, WsiError> {
+fn intern_atom(conn: &XCBConnection, name: &[u8]) -> Result<Atom, WsiError> {
     let cookie =
         xproto::intern_atom(conn, false, name).map_err(|e| WsiError::Backend(e.to_string()))?;
     let reply = cookie
@@ -69,7 +70,7 @@ fn intern_atom(conn: &RustConnection, name: &[u8]) -> Result<Atom, WsiError> {
 /// `Clone`/`Send` because the underlying X11 connection is not shareable across
 /// threads without extra locking.
 pub(crate) struct X11Window {
-    conn: RustConnection,
+    conn: XCBConnection,
     window: u32,
     wm_atoms: WmAtoms,
     width: u32,
@@ -169,12 +170,16 @@ impl X11Window {
         }
     }
 
-    /// Raw X11 surface handle for a later Vulkan swapchain.
+    /// Raw X11 surface handle for the Vulkan swapchain.
     ///
-    /// Returns [`RawSurfaceHandle::None`] in Phase 1; see the module docs for the
-    /// path to a real `xcb_connection_t*`.
+    /// Returns the `(xcb_connection_t*, window XID)` pair owned by this window. The
+    /// connection must stay alive — i.e. this [`X11Window`] must not be dropped — for
+    /// as long as any `VkSurfaceKHR` built from the handle exists.
     pub(crate) fn raw_surface_handle(&self) -> RawSurfaceHandle {
-        RawSurfaceHandle::None
+        RawSurfaceHandle::X11 {
+            connection: self.conn.get_raw_xcb_connection(),
+            window: self.window,
+        }
     }
 }
 
@@ -189,8 +194,10 @@ impl Drop for X11Window {
 
 /// Connect to the default display, honouring `$DISPLAY`. On a headless host the
 /// connection fails and we map that to [`WsiError::NoDisplay`].
-fn connect_to_display() -> Result<(RustConnection, usize), WsiError> {
-    RustConnection::connect(std::env::var("DISPLAY").ok().as_deref()).map_err(connect_error_to_wsi)
+fn connect_to_display() -> Result<(XCBConnection, usize), WsiError> {
+    // libxcb resolves `$DISPLAY` itself when the name is `None`; the error mapping is
+    // the same as for the pure-Rust connection (bad/missing display → `NoDisplay`).
+    XCBConnection::connect(None).map_err(connect_error_to_wsi)
 }
 
 /// Map a connection failure onto our coarse error set: a missing/unparseable display
@@ -204,7 +211,7 @@ fn connect_error_to_wsi(e: ConnectError) -> WsiError {
 
 /// Set the legacy `WM_NAME` property (Latin-1). Enough for Phase 1 window
 /// visibility; a future phase adds `_NET_WM_NAME` (UTF-8) with the `UTF8_STRING` atom.
-fn set_window_title(conn: &RustConnection, window: u32, title: &str) -> Result<(), WsiError> {
+fn set_window_title(conn: &XCBConnection, window: u32, title: &str) -> Result<(), WsiError> {
     let bytes = title.as_bytes();
     xproto::change_property(
         conn,
@@ -224,7 +231,7 @@ fn set_window_title(conn: &RustConnection, window: u32, title: &str) -> Result<(
 
 /// Advertise `WM_DELETE_WINDOW` so the window manager sends a `ClientMessage` on
 /// close instead of forcibly killing the client.
-fn set_wm_protocols(conn: &RustConnection, window: u32) -> Result<(), WsiError> {
+fn set_wm_protocols(conn: &XCBConnection, window: u32) -> Result<(), WsiError> {
     let wm_protocols = intern_atom(conn, WM_PROTOCOLS)?;
     let wm_delete_window = intern_atom(conn, WM_DELETE_WINDOW)?;
     let data = wm_delete_window.to_ne_bytes();
@@ -325,11 +332,24 @@ mod tests {
         }
     }
 
-    /// The raw surface handle is a Phase 1 stub on the pure-Rust backend.
+    /// On a display-capable host the raw surface handle must carry the real
+    /// `xcb_connection_t*` + XID pair (non-null pointer). On a headless host
+    /// construction fails first, so there is nothing to assert.
     #[test]
-    fn raw_handle_is_none_stub() {
-        // We cannot construct a window without a display, so assert the documented
-        // stub contract indirectly: `None` is a valid `RawSurfaceHandle`.
-        assert!(matches!(RawSurfaceHandle::None, RawSurfaceHandle::None));
+    fn raw_handle_carries_xcb_connection_and_xid() {
+        let mut w = match X11Window::new("nigg-test", 64, 48) {
+            Ok(w) => w,
+            Err(WsiError::NoDisplay) => return, // headless CI
+            Err(other) => panic!("unexpected WSI error: {other:?}"),
+        };
+        // Touch an event poll first so the server round-trip has flushed.
+        assert!(w.poll_event().is_ok());
+        match w.raw_surface_handle() {
+            RawSurfaceHandle::X11 { connection, window } => {
+                assert!(!connection.is_null(), "xcb_connection_t* must be non-null");
+                assert_ne!(window, 0, "window XID must be non-zero");
+            }
+            other => panic!("expected an X11 raw surface handle, got {other:?}"),
+        }
     }
 }

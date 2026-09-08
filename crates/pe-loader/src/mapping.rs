@@ -34,6 +34,21 @@ impl MappedImage {
             None
         }
     }
+
+    /// Release the mapping now (munmap), consuming `self`.
+    ///
+    /// `MappedImage` deliberately has no `Drop`: the main-image loader's `PeImage` keeps
+    /// the mapping alive for the whole `run` window and the process exits right after,
+    /// while the DLL registry wants explicit control (rollback of failed loads,
+    /// `FreeLibrary` unloads). Consuming self makes double-unmap impossible. Callers that
+    /// only hold `&MappedImage` (e.g. a registry entry being dropped) may unmap manually
+    /// on the same fields.
+    pub fn unmap(self) {
+        // SAFETY: `base..base+size` is exactly the anonymous mapping created at
+        // construction time; this value owns it and is consumed by the call, so the
+        // region is unmapped exactly once.
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.size) };
+    }
 }
 
 /// Errors that can occur during mapping or relocation.
@@ -65,7 +80,30 @@ pub enum MapError {
 /// `bytes` is the raw PE file; `pe` is goblin's parsed view. The image is mapped at the
 /// preferred `ImageBase` if possible (using `MAP_FIXED`), otherwise the kernel picks an
 /// address and the caller must apply relocations.
+///
+/// Used for the main executable image, which owns its preferred address space.
 pub fn map_image(bytes: &[u8], pe: &goblin::pe::PE) -> Result<MappedImage, MapError> {
+    map_image_with_preferred_base(bytes, pe, true)
+}
+
+/// Map a parsed PE like [`map_image`], but always let the kernel choose the load address
+/// (no `MAP_FIXED` attempt at the preferred `ImageBase`).
+///
+/// This is the DLL path: the image may be loaded at runtime on top of an already-running
+/// image, and stealing the preferred base could collide with the main image (or another
+/// DLL). Relocations make the image position-independent, so a kernel-chosen base is
+/// always correct.
+pub fn map_image_anywhere(bytes: &[u8], pe: &goblin::pe::PE) -> Result<MappedImage, MapError> {
+    map_image_with_preferred_base(bytes, pe, false)
+}
+
+/// Shared mapping core: `try_preferred` controls whether the loader attempts `MAP_FIXED`
+/// at the PE's preferred `ImageBase` before falling back to a kernel-chosen address.
+fn map_image_with_preferred_base(
+    bytes: &[u8],
+    pe: &goblin::pe::PE,
+    try_preferred: bool,
+) -> Result<MappedImage, MapError> {
     let opt = pe
         .header
         .optional_header
@@ -84,31 +122,16 @@ pub fn map_image(bytes: &[u8], pe: &goblin::pe::PE) -> Result<MappedImage, MapEr
         });
     }
 
-    // First try to map at the preferred base with MAP_FIXED. If that fails (address in
-    // use), fall back to a kernel-chosen address and relocations.
-    let base = match try_map_at(preferred as usize, mapped_size) {
-        Some(b) => b,
-        None => {
-            // SAFETY: anonymous private mapping, kernel-chosen address. Returns MAP_FAILED
-            // on failure.
-            let b = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    mapped_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            if b == libc::MAP_FAILED {
-                return Err(MapError::MmapFailed {
-                    size: mapped_size,
-                    msg: errno_str(),
-                });
-            }
-            b as *mut u8
+    // First try to map at the preferred base with MAP_FIXED (EXE path only). If that
+    // fails (address in use) or the caller asked us not to (DLL path), fall back to a
+    // kernel-chosen address and relocations.
+    let base = if try_preferred {
+        match try_map_at(preferred as usize, mapped_size) {
+            Some(b) => b,
+            None => map_anywhere(mapped_size)?,
         }
+    } else {
+        map_anywhere(mapped_size)?
     };
 
     // Zero the whole region first (mmap already does this, but being explicit protects
@@ -198,6 +221,33 @@ pub fn map_image(bytes: &[u8], pe: &goblin::pe::PE) -> Result<MappedImage, MapEr
         size: mapped_size,
         preferred_base: preferred,
     })
+}
+
+/// Anonymous RW mapping of `size` bytes at a kernel-chosen address (no `MAP_FIXED`).
+///
+/// Used when the preferred base is unavailable (or must not be used, e.g. DLLs loaded on
+/// top of a running image). Returns `MAP_FAILED` to the caller as `Err`.
+fn map_anywhere(size: usize) -> Result<*mut u8, MapError> {
+    // SAFETY: anonymous private mapping, kernel-chosen address. Returns MAP_FAILED on
+    // failure.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        Err(MapError::MmapFailed {
+            size,
+            msg: errno_str(),
+        })
+    } else {
+        Ok(p as *mut u8)
+    }
 }
 
 /// Map a helper to try `MAP_FIXED` at `preferred`. Returns the address on success.

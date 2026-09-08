@@ -7,7 +7,10 @@ license.workspace = true
 [features]
 default = ["x11"]
 # X11 backend via x11rb (needs libxcb1-dev at build time — present on this host).
-x11 = ["dep:x11rb"]
+# `allow-unsafe-code` swaps x11rb's pure-Rust connection for its libxcb-backed
+# `XCBConnection`, which is what exposes a real `xcb_connection_t*` for the
+# Vulkan `VK_KHR_xcb_surface` the DXGI swap chain builds at present time.
+x11 = ["dep:x11rb", "x11rb/allow-unsafe-code"]
 # Wayland backend via smithay-client-toolkit. OFF by default because it requires
 # libxkbcommon-dev / libwayland-dev system headers which are not guaranteed present.
 # The backend is a documented stub until those headers are available; enabling the

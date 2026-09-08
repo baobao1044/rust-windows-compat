@@ -74,10 +74,11 @@ pub enum WindowEvent {
 
 /// Opaque handle to a host window surface that a Vulkan swapchain can target.
 ///
-/// Phase 1 returns a small enum that the dxgi workstream can match on later to build
-/// a `VkSurfaceKHR` (via `ash`'s platform surface extensions). It does **not** hand
-/// out raw pointers directly; those are produced on demand by methods on the
-/// concrete backend so that `unsafe` stays local to the backend module.
+/// The dxgi workstream matches on this enum to build a `VkSurfaceKHR` (via `ash`'s
+/// platform surface extensions). It does **not** hand out raw pointers to arbitrary
+/// callers; those are produced on demand by methods on the concrete backend so that
+/// `unsafe` stays local to the backend module. The X11 variant carries the
+/// `xcb_connection_t*` + XID pair owned by the backend connection.
 #[derive(Debug, Clone, Copy)]
 pub enum RawSurfaceHandle {
     /// No backend is available (e.g. a stub window).

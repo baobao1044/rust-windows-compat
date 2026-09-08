@@ -23,6 +23,16 @@
 //!   `FreeEnvironmentStringsW` mapped onto `std::env`.
 //! - [`process`] — `GetCurrentProcessId`/`GetCurrentThreadId` (delegates), `GetModuleHandleW`,
 //!   `GetCommandLineW`/`GetCommandLineA`.
+//! - [`dllload`] — `LoadLibraryA`/`W`/`ExA`/`ExW`, `GetProcAddress`, `FreeLibrary`,
+//!   `DisableThreadLibraryCalls`: the module-loading surface, bridged to the real PE
+//!   loader (`nigg-pe-loader`) via function-pointer registration to avoid a reverse
+//!   crate dependency.
+//! - [`registry`] — advapi32 registry (in-memory store, seeded by [`spi`] with the
+//!   Secure Boot / integrity-check security-policy values) + `IsTextUnicode`.
+//! - [`tpm`] — TPM 2.0 Base Services (`tbs.dll` fake context handles, command probes)
+//!   plus the firmware/system-security queries (`GetFirmwareType`,
+//!   `GetFirmwareEnvironmentVariableA/W` — the `SecureBoot` EFI variable —,
+//!   `IsWow64Process`, `GetProductInfo`) and the advapi32 secure-boot probes.
 //! - [`string`] — `MultiByteToWideChar`/`WideCharToMultiByte`, `lstrlenW`/`lstrlenA`,
 //!   `lstrcpyW`/`lstrcatW`.
 //!
@@ -43,6 +53,7 @@ pub mod comctl32;
 pub mod comdlg32;
 pub mod console;
 pub mod crt;
+pub mod dllload;
 pub mod env;
 pub mod extras;
 pub mod extras2;
@@ -52,8 +63,10 @@ pub mod process;
 pub mod registry;
 pub mod shell32;
 pub mod shlwapi;
+pub mod spi;
 pub mod string;
 pub mod system_info;
+pub mod tpm;
 pub mod ucrt;
 
 /// A Windows `HANDLE`: an opaque, process-local 64-bit value (re-exported from ntapi).

@@ -867,6 +867,46 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
+    // Wire in the TPM 2.0 Base Services (tbs.dll) exports plus the firmware /
+    // system-security queries from `nigg-win32-kernel32::tpm` — the surfaces
+    // Windows 11-era games and anti-cheat query to verify system integrity:
+    // Tbsi_Context_Create/GetTpmVersion/Submit_Command (fake context handles
+    // minted from a counter), GetFirmwareType, GetFirmwareEnvironmentVariableA/W
+    // (the `SecureBoot` EFI-variable probe), IsWow64Process, GetProductInfo, and
+    // the advapi32 IsSecureBootEnabled/SystemSecureBootEnabled status probes.
+    // Same dedup pattern.
+    for e in nigg_win32_kernel32::tpm::tpm_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in the System Policy Information (advapi32 tree-copy/multi-value
+    // registry stubs) from `nigg-win32-kernel32::spi`. Calling spi_exports also
+    // seeds the Secure Boot / integrity-check registry defaults
+    // (UEFISecureBootEnabled, IntegrityChecks, BIOS SecureBoot) so the
+    // in-memory registry answers them before any guest runs. Same dedup
+    // pattern.
+    for e in nigg_win32_kernel32::spi::spi_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
     // Wire in the Winsock2 (ws2_32.dll) exports — the Windows Sockets API that
     // networked apps and userland anti-cheat DLLs (EAC, BattlEye) use for
     // telemetry communication. Each function delegates to the POSIX socket API.
@@ -1376,6 +1416,66 @@ mod tests {
         assert!(t.lookup("advapi32.dll", "IsTextUnicode").is_some());
         // Unknown advapi32 symbol still resolves to None.
         assert!(t.lookup("advapi32.dll", "DefinitelyNotReal").is_none());
+        // spi's registry stubs resolve too.
+        assert!(t.lookup("advapi32.dll", "RegCopyTreeW").is_some());
+        assert!(t
+            .lookup("advapi32.dll", "RegQueryMultipleValuesW")
+            .is_some());
+        assert!(t.lookup("advapi32.dll", "RegQueryInfoKeyW").is_some());
+        assert!(t.lookup("advapi32.dll", "RegDeleteTreeW").is_some());
+        assert!(t
+            .lookup("advapi32.dll", "RegResolveCustomKeyHandler")
+            .is_some());
+    }
+
+    #[test]
+    fn default_table_resolves_tpm_and_firmware_security_exports() {
+        let t = ImplTable::default_table();
+        // tbs.dll TPM 2.0 Base Services.
+        assert!(t.lookup("tbs.dll", "Tbsi_Context_Create").is_some());
+        assert!(t.lookup("tbs.dll", "Tbsi_Context_GetTpmVersion").is_some());
+        assert!(t.lookup("tbs.dll", "Tbsi_Get_Context").is_some());
+        assert!(t.lookup("tbs.dll", "Tbsip_Context_Close").is_some());
+        assert!(t.lookup("tbs.dll", "Tbsip_Submit_Command").is_some());
+        assert!(t.lookup("tbs.dll", "Tbsi_Get_TCG_Log").is_some());
+        assert!(t.lookup("tbs.dll", "Tbsi_Get_OwnerAuth").is_some());
+        assert!(t.lookup("tbs.dll", "Tbsi_Get_Owner_Auth").is_some());
+        // kernel32 firmware / system-security queries.
+        assert!(t.lookup("kernel32.dll", "GetFirmwareType").is_some());
+        assert!(t
+            .lookup("kernel32.dll", "GetFirmwareEnvironmentVariableA")
+            .is_some());
+        assert!(t
+            .lookup("kernel32.dll", "GetFirmwareEnvironmentVariableW")
+            .is_some());
+        assert!(t.lookup("kernel32.dll", "IsWow64Process").is_some());
+        assert!(t.lookup("kernel32.dll", "GetProductInfo").is_some());
+        // advapi32 secure-boot status probes (registered once per (dll, sym));
+        // the anticheat alias list points GetFirmwareType/IsSecureBootEnabled at
+        // the same implementations.
+        assert!(t.lookup("advapi32.dll", "IsSecureBootEnabled").is_some());
+        assert!(t
+            .lookup("advapi32.dll", "SystemSecureBootEnabled")
+            .is_some());
+        // No tbs symbol stubs out.
+        assert!(t.lookup("tbs.dll", "DefinitelyNotReal").is_none());
+    }
+
+    #[test]
+    fn build_table_wraps_tpm_impls_in_trampolines() {
+        // The real-loader path must produce thunk pointers (distinct from raw fn ptrs).
+        let mut arena = ThunkArena::new().expect("arena");
+        let t = ImplTable::build(&mut arena);
+        let p = t
+            .lookup("tbs.dll", "Tbsi_Context_Create")
+            .expect("tbs Tbsi_Context_Create resolved");
+        let raw = nigg_win32_kernel32::tpm::tbsi_context_create as FnPtr;
+        assert_ne!(p, raw, "build() wraps tbs impls in trampolines");
+        let p2 = t
+            .lookup("kernel32.dll", "GetFirmwareEnvironmentVariableA")
+            .expect("kernel32 GetFirmwareEnvironmentVariableA resolved");
+        let raw2 = nigg_win32_kernel32::tpm::get_firmware_environment_variable_a as FnPtr;
+        assert_ne!(p2, raw2, "build() wraps firmware probes in trampolines");
     }
 
     #[test]
