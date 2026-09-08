@@ -1,0 +1,24 @@
+[package]
+name = "nigg-game-visual"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# A "game-like" D3D11 PE that combines:
+# 1. System-integrity checks (like anti-cheat would do)
+# 2. Full D3D11 render pipeline with vertex/fragment shaders
+# 3. Draw call + presenting frames
+# 4. Message loop handling
+
+[[bin]]
+name = "game_visual"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]

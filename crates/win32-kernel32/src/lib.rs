@@ -53,6 +53,7 @@ pub mod registry;
 pub mod shell32;
 pub mod shlwapi;
 pub mod string;
+pub mod system_info;
 pub mod ucrt;
 
 /// A Windows `HANDLE`: an opaque, process-local 64-bit value (re-exported from ntapi).

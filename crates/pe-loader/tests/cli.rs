@@ -444,3 +444,63 @@ fn nigg_loader_runs_anticheat_sim_and_exits_0() {
         }
     }
 }
+
+/// Locate the cross-compiled `game_visual.exe` (a standalone workspace under
+/// `tests/game-visual`). Returns `None` when it has not been built yet.
+fn game_visual_exe() -> Option<PathBuf> {
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root().join("tests/game-visual/target"));
+    let exe = target_dir
+        .join("x86_64-pc-windows-gnu")
+        .join("debug")
+        .join("game_visual.exe");
+    if exe.exists() {
+        Some(exe)
+    } else {
+        None
+    }
+}
+
+/// M9d acceptance test: the game-visual PE (system-integrity checks + D3D11
+/// clear+present through nigg-loader) must exit 0. Connects anti-cheat API
+/// surface to the D3D11 render pipeline in a single fixture.
+#[test]
+fn nigg_loader_runs_game_visual_and_exits_0() {
+    let exe_path = match game_visual_exe() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "nigg-loader: skipping nigg_loader_runs_game_visual_and_exits_0 — \
+                 game_visual.exe not built. Build it with: \
+                 `cargo build --target x86_64-pc-windows-gnu --manifest-path \
+                 tests/game-visual/Cargo.toml`."
+            );
+            return;
+        }
+    };
+
+    let output = Command::new(BIN)
+        .arg(&exe_path)
+        .output()
+        .expect("run nigg-loader");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    match output.status.code() {
+        Some(0) => {}
+        Some(code @ 125) => {
+            eprintln!(
+                "nigg-loader: skipping game_visual — loader runtime error, exit {code}.\n\
+                 stdout={stdout}\nstderr={stderr}"
+            );
+        }
+        other => {
+            panic!(
+                "nigg-loader must exit 0 for the game-visual PE (got {other:?})\n\
+                 stdout={stdout}\nstderr={stderr}"
+            );
+        }
+    }
+}

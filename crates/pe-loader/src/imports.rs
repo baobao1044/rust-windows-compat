@@ -850,6 +850,23 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
+    // Wire in the ntdll system-information exports (NtQuerySystemInformation,
+    // NtQueryInformationProcess) — anti-cheat calls these to inspect the
+    // process environment, detect debuggers/hypervisors, and read
+    // Secure Boot / firmware state. Same dedup pattern.
+    for e in nigg_win32_kernel32::system_info::system_info_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
     // Wire in the Winsock2 (ws2_32.dll) exports — the Windows Sockets API that
     // networked apps and userland anti-cheat DLLs (EAC, BattlEye) use for
     // telemetry communication. Each function delegates to the POSIX socket API.
