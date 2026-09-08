@@ -144,7 +144,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
 
     // Apply base relocations if the image was loaded at a different base than preferred.
     if let Some(reloc_dir) = opt.data_directories.get_base_relocation_table() {
-        mapping::apply_relocations(&mapped, bytes, *reloc_dir)?;
+        mapping::apply_relocations(&mapped, bytes, &pe, *reloc_dir)?;
     }
 
     // Resolve imports and write the IAT. We build ABI-correct Win64->SysV trampolines in

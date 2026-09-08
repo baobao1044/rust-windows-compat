@@ -309,9 +309,21 @@ fn section_prot(name: &str, characteristics: u32) -> c_int {
 /// `reloc_dir` is the base-relocation data directory (`(rva, size)`). We walk the block
 /// stream: each block is a 4-byte page RVA, a 4-byte count, then `count` 2-byte entries
 /// whose low 4 bits are the relocation type and high 12 bits are the page offset.
+///
+/// When the image is already at its preferred base (`delta == 0`, the main EXE case) the
+/// table is skipped without touching memory: every entry would patch in the identical
+/// value, and — since `map_image` already applied per-section permissions — the targets
+/// may be read-only pages, where any pointless write would fault.
+///
+/// When `delta != 0` (runtime-loaded DLLs), each target page is flipped writable
+/// (`mprotect`), patched, and then restored to its section's intended protection, since
+/// `map_image` has already downgraded sections to their final permissions and Windows
+/// semantics require relocations to apply to read-only data (pointer tables live in
+/// `.rdata`).
 pub fn apply_relocations(
     img: &MappedImage,
     bytes: &[u8],
+    pe: &goblin::pe::PE,
     reloc_dir: goblin::pe::data_directories::DataDirectory,
 ) -> Result<(), MapError> {
     let dir_rva = reloc_dir.virtual_address;
@@ -321,6 +333,16 @@ pub fn apply_relocations(
     }
 
     let delta = (img.base as u64).wrapping_sub(img.preferred_base) as i64;
+    if delta == 0 {
+        // The image loads at its preferred base: absolute references are already
+        // correct and patching would only write identical values into (possibly
+        // read-only) section pages.
+        log::debug!(
+            "image at preferred base {:#x}; relocations not needed",
+            img.base as usize
+        );
+        return Ok(());
+    }
 
     // Resolve the relocation directory bytes from the file. We read from the file bytes
     // (which contain the raw .reloc section) using goblin's RVA->offset helpers via the
@@ -335,6 +357,7 @@ pub fn apply_relocations(
     }
     let reloc_bytes = &bytes[reloc_start..reloc_start + dir_size];
 
+    let page = page_size();
     let mut pos = 0usize;
     while pos + 8 <= reloc_bytes.len() {
         let page_rva = u32::from_le_bytes([
@@ -366,7 +389,42 @@ pub fn apply_relocations(
                 Some(p) => p,
                 None => return Err(MapError::RelocRvaOutOfRange(target_rva as u32)),
             };
-            apply_one_reloc(target, typ, delta)?;
+            // Flip the enclosing page(s) writable, patch, and restore the page's
+            // intended protection (map_image already applied section permissions; a
+            // relocation must land even on read-only pages, as Windows loaders do).
+            let (flip_start, flip_len, restore_prot) =
+                unprotect_span(img, pe, target as usize, 8, page);
+            // SAFETY: `flip_start..flip_start+flip_len` is a page-aligned sub-region of
+            // the mapped image (computed via rva_to_ptr + page rounding); mprotect to
+            // RW so the patch can write.
+            let rc = unsafe {
+                libc::mprotect(
+                    flip_start as *mut libc::c_void,
+                    flip_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            if rc != 0 {
+                return Err(MapError::MprotectFailed {
+                    section: "relocation target".to_string(),
+                    addr: flip_start as *const u8,
+                    len: flip_len,
+                    msg: errno_str(),
+                });
+            }
+            let patched = apply_one_reloc(target, typ, delta);
+            // SAFETY: restore the section's final protection over the same span that
+            // was flipped writable (even when the patch failed, the page must not stay
+            // writable).
+            let rc =
+                unsafe { libc::mprotect(flip_start as *mut libc::c_void, flip_len, restore_prot) };
+            if rc != 0 {
+                log::warn!(
+                    "mprotect(restore) at {flip_start:#x} ({flip_len} bytes) failed: {errno_str}",
+                    errno_str = errno_str()
+                );
+            }
+            patched?;
         }
         pos += block_size;
     }
@@ -374,31 +432,96 @@ pub fn apply_relocations(
     Ok(())
 }
 
+/// The `(page-aligned start, len, restore-prot)` triple needed to patch a mapping span
+/// of `span` bytes starting at `addr`: the span's pages are rounded out, and the restore
+/// protection is the intended protection of the section containing `rva` as computed by
+/// [`section_prot`] (or `PROT_READ|PROT_WRITE` for the headers region that `map_image`
+/// leaves writable).
+fn unprotect_span(
+    img: &MappedImage,
+    pe: &goblin::pe::PE,
+    addr: usize,
+    span: usize,
+    page: usize,
+) -> (usize, usize, c_int) {
+    let addr = addr as usize;
+    let start = addr & !(page - 1);
+    let end = round_up(addr + span, page);
+    let len = end - start;
+    // Locate the section that contains the patch address (given as a host address, so
+    // compare against the image base) to restore its intended protection afterwards.
+    let rva = addr.saturating_sub(img.base as usize) as u32;
+    let restore_prot = pe.sections.iter().find_map(|sec| {
+        let va = sec.virtual_address as usize;
+        let vsz = sec.virtual_size as usize;
+        let name = sec.name().unwrap_or("");
+        if rva as usize >= va && (rva as usize) < va + vsz {
+            let p = section_prot(name, sec.characteristics);
+            // Never restore to Prot nothing below read; sections without a read flag
+            // keep a readable floor so the guest can still read them.
+            Some(p | libc::PROT_READ)
+        } else {
+            None
+        }
+    });
+    match restore_prot {
+        Some(p) => (start, len, p),
+        // No owning section (headers region): map_image leaves those pages RW.
+        None => (start, len, libc::PROT_READ | libc::PROT_WRITE),
+    }
+}
+
 /// Apply a single relocation at `target` of `typ` with the `delta` to add.
+///
+/// `typ` values are **base-relocation** entry types per the PE/COFF spec
+/// (`IMAGE_REL_BASED_*`: ABSOLUTE=0, HIGH=1, LOW=2, HIGHLOW=3, HIGHADJ=4, DIR64=10),
+/// which are a different table from the COFF *symbol* relocation codes
+/// (`IMAGE_REL_AMD64_*`) goblin maps during linking. The x64 standard set is `DIR64`
+/// for 64-bit absolute addresses (pointer tables, `.refptr` slots) and `HIGHLOW`
+/// for 32-bit ones. The main image loads at its preferred base (delta == 0), so this
+/// only has observable effect for runtime-loaded DLLs.
 fn apply_one_reloc(target: *mut u8, typ: u16, delta: i64) -> Result<(), MapError> {
-    // AMD64 relocation types we handle: 0 = absolute (skip), 1 = DIR64 (add delta to a
-    // 64-bit value). Others are rare in x64 images and are left untouched (logged).
     match typ {
-        // IMAGE_REL_AMD64_ABSOLUTE
+        // IMAGE_REL_BASED_ABSOLUTE: padding, skip.
         0 => Ok(()),
-        // IMAGE_REL_AMD64_ADDR64
-        1 => {
+        // IMAGE_REL_BASED_DIR64: 64-bit absolute address — patch `+= delta`.
+        10 => {
             // SAFETY: `target..target+8` is within the mapped image (validated by
-            // rva_to_ptr) and was mapped writable-or-relocated. We read-modify-write a
-            // little-endian u64 adding `delta`.
+            // rva_to_ptr) and is writable while relocations are applied (before the
+            // section permissions downgrade). Read-modify-write a little-endian u64.
             let old = unsafe { std::ptr::read_unaligned(target as *const u64) };
             let new = (old as i64).wrapping_add(delta) as u64;
             unsafe { std::ptr::write_unaligned(target as *mut u64, new) };
             Ok(())
         }
-        // IMAGE_REL_AMD64_ADDR32NB (RVA-only) — no delta for image-relative references.
-        3 => Ok(()),
-        // IMAGE_REL_AMD64_SECREL (32-bit section-relative offset) — the offset
-        // is relative to the section start, not the image base, so it doesn't
-        // change when we relocate. Used in .pdata exception tables.
-        10 => Ok(()),
-        // IMAGE_REL_AMD64_SECTION (16-bit section index) — no adjustment needed.
-        11 => Ok(()),
+        // IMAGE_REL_BASED_HIGHLOW: 32-bit absolute address `+= delta` (wrapped — the
+        // delta may be negative when the image loads below its preferred base).
+        3 => {
+            // SAFETY: `target..target+4` is within the mapped image (validated above).
+            let old = unsafe { std::ptr::read_unaligned(target as *const u32) };
+            let new = (old as i64).wrapping_add(delta) as u32;
+            unsafe { std::ptr::write_unaligned(target as *mut u32, new) };
+            Ok(())
+        }
+        // IMAGE_REL_BASED_LOW: the 16-bit low half of a 32-bit address — add the low
+        // 16 bits of the delta (rare; the carry pair would have been HIGH).
+        2 => {
+            // SAFETY: `target..target+2` is within the mapped image (validated above).
+            let old = unsafe { std::ptr::read_unaligned(target as *const u16) };
+            let new = (old as usize).wrapping_add(delta as isize as usize) as u16;
+            unsafe { std::ptr::write_unaligned(target as *mut u16, new) };
+            Ok(())
+        }
+        // IMAGE_REL_BASED_HIGH (1) / HIGHADJ (4): the 16-bit **high** half of a 32-bit
+        // pointer split across two relocation entries. The exact computation pairs the
+        // entries (the HIGHADJ carry fix needs the next entry's LOW half), which this
+        // per-entry walker does not model. These are 32-bit-era types that x64 linkers
+        // (MSVC and mingw) don't emit for images (they use DIR64/HIGHLOW), so a log +
+        // skip is honest here rather than a corruption risk.
+        1 | 4 => {
+            log::debug!("skipping rare relocation type {typ} (HIGH/HIGHADJ) at {target:p}");
+            Ok(())
+        }
         other => {
             log::debug!("skipping unsupported relocation type {other} at {target:p}");
             Ok(())

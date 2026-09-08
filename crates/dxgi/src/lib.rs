@@ -766,6 +766,14 @@ mod tests {
         assert_ne!(img, vk::Image::null());
         // One present against the real X11 surface must succeed.
         sc.present(0).expect("present to the window should succeed");
+        // The surface must survive a ResizeBuffers: the swap chain is re-created
+        // against the same visible surface (no degradation to headless).
+        sc.resize_buffers(192, 96)
+            .expect("resize buffers should succeed");
+        assert_eq!(sc.present_mode(), PresentMode::Windowed);
+        let resized = sc.desc();
+        assert!(resized.width >= 1 && resized.height >= 1);
+        sc.present(0).expect("present after resize should succeed");
         let _ = window.poll_event();
     }
 }

@@ -171,7 +171,7 @@ pub fn load_dll_ex(path: &Path, run_dll_main: bool) -> Result<*mut c_void, LoadE
 
     // Apply base relocations so absolute addresses match the actual base.
     if let Some(reloc_dir) = opt.data_directories.get_base_relocation_table() {
-        apply_relocations(&mapped, &bytes, *reloc_dir)?;
+        apply_relocations(&mapped, &bytes, &pe, *reloc_dir)?;
     }
 
     // Resolve the DLL's imports against our own implementation surface: the DLL calls
