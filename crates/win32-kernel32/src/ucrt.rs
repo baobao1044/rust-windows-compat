@@ -1477,6 +1477,9 @@ pub fn ucrt_exports() -> Vec<UcrtSpec> {
         // stdio / FILE
         u!("__acrt_iob_func", acrt_iob_func, 1),
         u!("_errno", errno, 0),
+        // multi-thread lock table (CRT startup / streams); no-ops in the nigg CRT
+        u!("_lock", crate::crt::lock, 1),
+        u!("_unlock", crate::crt::unlock, 1),
         // argv / environment init
         u!("_configure_narrow_argv", configure_narrow_argv, 1),
         u!(

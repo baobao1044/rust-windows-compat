@@ -1,0 +1,21 @@
+[package]
+name = "nigg-dllload-exe"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+# A PE fixture that drives the runtime DLL-loading surface end to end:
+# 1. `kernel32!LoadLibraryA("nigg_dllload.dll")` — the loader maps the DLL (a real
+#    cross-compiled Windows PE built by the `dll` member of this workspace), resolves its
+#    imports, applies relocations, and runs `DllMain(DLL_PROCESS_ATTACH)`.
+# 2. `kernel32!GetProcAddress(h, "dll_increment"/"dll_count")` — resolves the DLL's real
+#    export-table entries; a missing export ("dll_absent") must resolve to NULL.
+# 3. Calls the resolved export (native Win64 code in the DLL) to increment an atomic
+#    counter and verifies the counter moved by exactly one.
+# 4. `kernel32!FreeLibrary(h)` — unloads the module (TRUE expected).
+# 5. `ExitProcess(0)` on success; a distinct code in the 10..=20 range per failed stage.
+
+[[bin]]
+name = "dllload_test"
+path = "src/main.rs"

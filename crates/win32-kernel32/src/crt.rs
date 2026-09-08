@@ -354,6 +354,17 @@ pub extern "C" fn atexit(_fn: *mut c_void) -> c_int {
 /// `msvcrt!_cexit() -> void`. No-op (CRT cleanup without exit).
 pub extern "C" fn cexit() {}
 
+/// `msvcrt!_lock(int locknum)`. Acquires one of the msvcrt multi-thread lock-table
+/// entries the CRT uses to serialize streams/startup. The nigg CRT surface runs on the
+/// loader's single guest thread (and `fprintf`-family outputs go straight to the fd with
+/// no shared buffered state), so acquiring is a no-op — the mingw CRT init and DLL
+/// startup sequences call it though, so the symbol must exist to avoid a trap stub.
+pub extern "C" fn lock(_locknum: c_int) {}
+
+/// `msvcrt!_unlock(int locknum)`. Releases the lock acquired by [`lock`]; no-op for the
+/// same reason.
+pub extern "C" fn unlock(_locknum: c_int) {}
+
 /// `msvcrt!_amsg_exit(int) -> !`. Terminates with the given exit code.
 pub extern "C" fn amsg_exit(code: c_int) -> ! {
     log::trace!("msvcrt!_amsg_exit({code})");
@@ -435,6 +446,9 @@ pub fn crt_export_specs() -> Vec<CrtSpec> {
         c!("__iob_func", iob_func, 0),
         c!("fprintf", fprintf, 2),
         c!("vfprintf", vfprintf, 3),
+        // multi-thread lock table (mingw CRT init / DLL startup calls it)
+        c!("_lock", lock, 1),
+        c!("_unlock", unlock, 1),
         // process / init
         c!("__getmainargs", getmainargs, 5),
         c!("__set_app_type", set_app_type, 1),

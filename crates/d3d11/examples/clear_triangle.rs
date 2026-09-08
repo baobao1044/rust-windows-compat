@@ -13,9 +13,12 @@
 //! 6. (Stretch) Compile a trivial HLSL VS+PS via `nigg_hlsl_compiler::compile`,
 //!    create a vertex buffer, and draw a green triangle.
 //! 7. Present + flush.
+//! 8. For a *windowed* swap chain (real X11 window): keep presenting until the user
+//!    closes the window (capped at 30 s so the demo never hangs unattended).
 //!
 //! The demo must NOT hang or panic if there is no display — it creates the Vulkan
-//! device and swap chain, attempts the clear, and exits cleanly.
+//! device and swap chain, attempts the clear, and exits cleanly. `NIGG_HEADLESS=1`
+//! forces the invisible headless swap-chain path even with a display available.
 
 use std::sync::Arc;
 
@@ -108,9 +111,30 @@ fn main() {
     swap_chain.present(0).expect("present");
     println!("[demo] flushed + presented — M6b demo complete");
 
-    // Drain one event so the X11 window is visible briefly (best-effort).
-    if let Some(mut w) = window {
-        let _ = w.poll_event();
+    // Stay on screen with the presented frame visible until the user closes the
+    // window, so the X11 presentation is actually observable. The wait is capped so
+    // the demo never hangs unattended, and only runs for a windowed swap chain (the
+    // headless/offscreen paths show nothing, and without a window there is no close
+    // button to press). The window dies after the swap chain, keeping the
+    // xcb_connection_t* behind its VkSurfaceKHR alive for as long as the surface
+    // exists.
+    if swap_chain.present_mode() == nigg_dxgi::PresentMode::Windowed {
+        if let Some(mut w) = window {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                while let Ok(Some(event)) = w.poll_event() {
+                    if matches!(event, nigg_wsi::WindowEvent::Close) {
+                        println!("[demo] window closed");
+                        return;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    println!("[demo] presentation wait budget elapsed; exiting");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+        }
     }
 }
 

@@ -68,6 +68,7 @@ pub mod string;
 pub mod system_info;
 pub mod tpm;
 pub mod ucrt;
+pub mod xinput;
 
 /// A Windows `HANDLE`: an opaque, process-local 64-bit value (re-exported from ntapi).
 pub type Handle = u64;

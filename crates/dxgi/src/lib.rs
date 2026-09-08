@@ -4,15 +4,21 @@
 //! (workstream M6b). It owns the Vulkan instance, physical/logical device and the
 //! graphics queue, and exposes a swap chain backed by a real `VkSwapchainKHR`.
 //!
-//! Because the WSI layer's pure-Rust X11 backend cannot yet hand out an
-//! `xcb_connection_t*` (see `nigg_wsi::RawSurfaceHandle`), a real X11
-//! `VkSurfaceKHR` is not buildable today. Instead the swap chain targets a
-//! **headless** surface (`VK_EXT_headless_surface`) when the loader advertises it,
-//! which needs no display server at all. `vkQueuePresentKHR` against a headless
-//! surface is defined to succeed (the image is simply not shown), so the whole
-//! clear/present path stays exercisable on a headless host. When the headless
-//! extension is missing the swap chain falls back to an **offscreen** path that
-//! allocates its own color images and makes `Present` a no-op.
+//! Whenever the caller hands in a real window whose WSI backend exposes an
+//! `xcb_connection_t*` + XID pair ([`nigg_wsi::RawSurfaceHandle::X11`]), the swap
+//! chain presents to a genuine on-screen `VkSurfaceKHR` created with
+//! `VK_KHR_xcb_surface` on that window. Otherwise it degrades, in order of
+//! preference:
+//!
+//! - **headless** (`VK_EXT_headless_surface`) — needs no display server at all;
+//!   `vkQueuePresentKHR` against a headless surface is defined to succeed (the image
+//!   is simply not shown), so the whole clear/present path stays exercisable on a
+//!   headless host.
+//! - **offscreen** — when even the headless extension is missing, the swap chain
+//!   allocates its own colour images and makes `Present` a no-op.
+//!
+//! Set `NIGG_HEADLESS=1` to force the headless/offscreen fallback even when a real
+//! window is available (CI / no-desktop-interference testing).
 //!
 //! The [`VkCtx`] (shared Vulkan instance/device/queue) is `Arc`-shared with the
 //! `nigg-d3d11` crate so the D3D11 device and immediate context drive the same
@@ -136,8 +142,12 @@ impl Factory {
     /// Create a swap chain for `window` using `desc`.
     ///
     /// `window` is optional so the headless path can be exercised without a real
-    /// OS window. If `window` resolves to [`nigg_wsi::RawSurfaceHandle::None`] (the
-    /// current WSI default) the swap chain targets a headless/offscreen surface.
+    /// OS window. If `window` resolves to a real [`nigg_wsi::RawSurfaceHandle`] (the
+    /// X11 backend hands out its `xcb_connection_t*` + XID), the swap chain presents
+    /// to a genuine `VkSurfaceKHR` on that window; if it resolves to
+    /// [`nigg_wsi::RawSurfaceHandle::None`] (no display server) it targets a
+    /// headless/offscreen surface. Failure of the real-surface bring-up degrades to
+    /// headless/offscreen with a warning rather than failing the whole call.
     pub fn create_swap_chain(
         &self,
         window: Option<&nigg_wsi::Window>,
@@ -150,21 +160,24 @@ impl Factory {
 /// The rendering mode the swap chain ended up in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentMode {
+    /// A real `VkSwapchainKHR` presenting to a visible host window (X11/XCB
+    /// surface).
+    Windowed,
     /// A real `VkSwapchainKHR` against a headless `VkSurfaceKHR` (no display).
     Headless,
     /// Offscreen colour images allocated directly; `Present` is a no-op.
     Offscreen,
 }
 
-/// `IDXGISwapChain` — a swap chain backed by `VkSwapchainKHR` (headless) or by
-/// directly-allocated colour images (offscreen fallback).
+/// `IDXGISwapChain` — a swap chain backed by `VkSwapchainKHR` (windowed or headless)
+/// or by directly-allocated colour images (offscreen fallback).
 pub struct SwapChain {
     ctx: Arc<VkCtx>,
     desc: SwapChainDesc,
     mode: PresentMode,
-    /// The surface, when `mode == Headless`. Destroyed on drop.
+    /// The surface, when `mode != Offscreen`. Destroyed on drop.
     surface: vk::SurfaceKHR,
-    /// The swapchain, when `mode == Headless`. Destroyed on drop.
+    /// The swapchain, when `mode != Offscreen`. Destroyed on drop.
     swapchain: vk::SwapchainKHR,
     /// Back-buffer images (from the swapchain or directly allocated).
     images: Vec<vk::Image>,
@@ -179,17 +192,36 @@ impl SwapChain {
         window: Option<&nigg_wsi::Window>,
         desc: SwapChainDesc,
     ) -> Result<Self, DxgiError> {
+        // `NIGG_HEADLESS=1` forces the invisible headless/offscreen path even when a
+        // real window is around (used by CI / desktop-interference-free testing).
+        let headless_forced =
+            std::env::var_os("NIGG_HEADLESS").is_some_and(|v| v == "1" || v == "true");
         let handle = window
             .map(|w| w.raw_surface_handle())
             .unwrap_or(nigg_wsi::RawSurfaceHandle::None);
-        let real_surface_available = !matches!(handle, nigg_wsi::RawSurfaceHandle::None);
 
-        // Prefer a real window surface, then headless, then offscreen.
-        if real_surface_available {
-            // The WSI backend would hand us a real handle here; wiring the actual
-            // XCB/Xlib surface creation is left to a later phase once WSI exposes a
-            // real `xcb_connection_t*`. Fall through to the headless/offscreen path.
-            log::debug!("real surface handle present but not yet wired; using headless/offscreen");
+        // Prefer a real visible window surface, then headless, then offscreen. Any
+        // failure of the X11 bring-up degrades (with a warning) instead of failing the
+        // call — an invisible-but-working present beats a hard error on misconfigured
+        // hosts.
+        if let nigg_wsi::RawSurfaceHandle::X11 {
+            connection,
+            window: window_id,
+        } = handle
+        {
+            if headless_forced {
+                log::debug!("NIGG_HEADLESS is set; real window surfaces are disabled");
+            } else {
+                match Self::new_x11(ctx.clone(), connection, window_id, desc) {
+                    Ok(sc) => return Ok(sc),
+                    Err(e) => {
+                        log::warn!(
+                            "presenting to the X11 window failed ({e}); falling back to \
+                             headless/offscreen"
+                        );
+                    }
+                }
+            }
         }
 
         if ctx.has_headless_surface {
@@ -197,6 +229,33 @@ impl SwapChain {
         } else {
             Self::new_offscreen(ctx, desc)
         }
+    }
+
+    /// Build a real on-screen surface (`VK_KHR_xcb_surface`) on the X11
+    /// connection/window pair handed out by the WSI layer, then bring up the swap
+    /// chain on it.
+    fn new_x11(
+        ctx: Arc<VkCtx>,
+        connection: *mut core::ffi::c_void,
+        window_id: u32,
+        desc: SwapChainDesc,
+    ) -> Result<Self, DxgiError> {
+        let Some(xcb_ext) = ctx.xcb_surface_ext.as_ref() else {
+            return Err(DxgiError::MissingExtension("VK_KHR_xcb_surface"));
+        };
+        let create_info = vk::XcbSurfaceCreateInfoKHR::default()
+            .connection(connection)
+            .window(window_id);
+        let surface = unsafe {
+            // SAFETY: the instance was created with VK_KHR_xcb_surface enabled.
+            // `connection` is the `xcb_connection_t*` of the wsi X11 window and
+            // `window_id` its XID; the wsi `Window` owns that connection and outlives
+            // the surface (and swap chain) built on top of it, so both pointers stay
+            // valid for the surface's lifetime. There is no `p_next` chain.
+            xcb_ext.create_xcb_surface(&create_info, None)
+        }
+        .map_err(|e| DxgiError::Vulkan(format!("create xcb surface: {e}")))?;
+        Self::new_with_surface(ctx, surface, PresentMode::Windowed, desc)
     }
 
     fn new_headless(ctx: Arc<VkCtx>, desc: SwapChainDesc) -> Result<Self, DxgiError> {
@@ -208,10 +267,23 @@ impl SwapChain {
             headless_ext.create_headless_surface(&create_info, None)
         }
         .map_err(|e| DxgiError::Vulkan(format!("create headless surface: {e}")))?;
+        Self::new_with_surface(ctx, surface, PresentMode::Headless, desc)
+    }
 
+    /// Bring up a swap chain targeting the already-created `surface`.
+    ///
+    /// Takes ownership of `surface`: every error path destroys it before returning,
+    /// and success stores it (dropped later by [`SwapChain::destroy_resources`]).
+    fn new_with_surface(
+        ctx: Arc<VkCtx>,
+        surface: vk::SurfaceKHR,
+        mode: PresentMode,
+        desc: SwapChainDesc,
+    ) -> Result<Self, DxgiError> {
         // Verify the graphics queue family can present to this surface. Headless
-        // surfaces support present on any queue family per the extension, but we
-        // check explicitly so a non-conforming implementation fails loudly.
+        // surfaces support present on any queue family per the extension, windows
+        // usually cannot be driven from arbitrary families, so we check explicitly so
+        // a non-conforming/mismatched setup fails loudly.
         let supported = unsafe {
             // SAFETY: `surface` is a valid VkSurfaceKHR and the physical device is
             // valid; the queue family index is in range.
@@ -235,11 +307,12 @@ impl SwapChain {
                 ctx.surface_ext.destroy_surface(surface, None);
             }
             return Err(DxgiError::Vulkan(
-                "graphics queue family does not support present on the headless surface".into(),
+                "graphics queue family does not support present on the surface".into(),
             ));
         }
 
-        // Surface format/extent: headless surfaces report the requested extent.
+        // Surface format/extent: a real window reports its client area as
+        // `current_extent`; headless surfaces report the requested extent.
         let formats = unsafe {
             // SAFETY: valid physical device + surface.
             ctx.surface_ext
@@ -328,7 +401,7 @@ impl SwapChain {
                 height: extent.height,
                 ..desc
             },
-            mode: PresentMode::Headless,
+            mode,
             surface,
             swapchain,
             images,
@@ -435,11 +508,12 @@ impl SwapChain {
 
     /// Acquire the next back buffer for rendering. Returns the image index.
     ///
-    /// For the headless path this calls `vkAcquireNextImageKHR` (synchronised with an
-    /// internal fence). For the offscreen path it round-robins through the images.
+    /// For the windowed/headless paths this calls `vkAcquireNextImageKHR`
+    /// (synchronised with an internal fence). For the offscreen path it round-robins
+    /// through the images.
     pub fn acquire_next(&mut self, fence: vk::Fence) -> Result<usize, DxgiError> {
         match self.mode {
-            PresentMode::Headless => {
+            PresentMode::Windowed | PresentMode::Headless => {
                 let (_idx, _suboptimal) = unsafe {
                     // SAFETY: `swapchain` is valid; `fence` is a valid fence the caller
                     // will wait on. Using a null semaphore; we gate on the fence.
@@ -462,11 +536,11 @@ impl SwapChain {
         }
     }
 
-    /// `Present(sync_interval)` — `vkQueuePresentKHR` for the headless path, a no-op
-    /// for the offscreen path. `sync_interval` is accepted for API parity with DXGI
-    /// but currently maps to FIFO (vsync) present in all cases.
+    /// `Present(sync_interval)` — `vkQueuePresentKHR` for the windowed/headless
+    /// paths, a no-op for the offscreen path. `sync_interval` is accepted for API
+    /// parity with DXGI but currently maps to FIFO (vsync) present in all cases.
     pub fn present(&mut self, _sync_interval: u32) -> Result<(), DxgiError> {
-        if self.mode == PresentMode::Headless {
+        if self.mode != PresentMode::Offscreen {
             let index = self.current as u32;
             let present_info = vk::PresentInfoKHR::default()
                 .swapchains(std::slice::from_ref(&self.swapchain))
@@ -480,7 +554,7 @@ impl SwapChain {
             }
             .map_err(|e| DxgiError::Vulkan(format!("queue present: {e}")))?;
         }
-        // Advance the round-robin index for the offscreen path / next headless frame.
+        // Advance the round-robin index for the offscreen path / next presented frame.
         self.current = (self.current + 1) % self.images.len().max(1);
         Ok(())
     }
@@ -488,7 +562,9 @@ impl SwapChain {
     /// `ResizeBuffers(width, height)` — recreate the swap chain at a new size.
     ///
     /// Destroys the old swap chain (and offscreen images) and builds a new one. The
-    /// format and buffer count are preserved.
+    /// format and buffer count are preserved. A windowed swap chain keeps its
+    /// (still-valid) `VkSurfaceKHR` and only re-creates the swap chain against it;
+    /// headless/offscreen modes rebuild their whole surface/images.
     pub fn resize_buffers(&mut self, width: u32, height: u32) -> Result<(), DxgiError> {
         let desc = SwapChainDesc {
             width,
@@ -496,41 +572,58 @@ impl SwapChain {
             format: self.desc.format,
             buffer_count: self.desc.buffer_count,
         };
-        // Tear down the current resources, keeping the ctx.
-        self.destroy_resources();
-        let ctx = self.ctx.clone();
-        *self = if ctx.has_headless_surface {
-            Self::new_headless(ctx, desc)?
+        if self.mode == PresentMode::Windowed {
+            // The surface belongs to this swap chain and stays valid; re-create only
+            // the swap chain against it.
+            let surface = self.surface;
+            self.surface = vk::SurfaceKHR::null();
+            self.destroy_resources();
+            let ctx = self.ctx.clone();
+            *self = Self::new_with_surface(ctx, surface, PresentMode::Windowed, desc)?;
         } else {
-            Self::new_offscreen(ctx, desc)?
-        };
+            // Tear down the current resources, keeping the ctx.
+            self.destroy_resources();
+            let ctx = self.ctx.clone();
+            *self = if ctx.has_headless_surface {
+                Self::new_headless(ctx, desc)?
+            } else {
+                Self::new_offscreen(ctx, desc)?
+            };
+        }
         Ok(())
     }
 
     fn destroy_resources(&mut self) {
+        self.destroy_swapchain_resources();
         unsafe {
-            // SAFETY: all handles below were created from `ctx.device`/the surface/swapchain
-            // extensions and are valid until destroyed here; each is destroyed exactly once.
+            // SAFETY: `surface` was created from `ctx.surface_ext` and is valid until
+            // destroyed here; it is destroyed exactly once (nulled right after).
+            if self.surface != vk::SurfaceKHR::null() {
+                self.ctx.surface_ext.destroy_surface(self.surface, None);
+            }
+        }
+        self.surface = vk::SurfaceKHR::null();
+    }
+
+    /// Destroy the swap chain and per-buffer resources, keeping the surface alive.
+    fn destroy_swapchain_resources(&mut self) {
+        unsafe {
+            // SAFETY: all handles below were created from `ctx.device`/swapchain and
+            // are valid until destroyed here; each is destroyed exactly once.
             for (image, memory) in self.images.iter().zip(self.offscreen_memory.iter()) {
                 if self.mode == PresentMode::Offscreen {
                     self.ctx.device.destroy_image(*image, None);
                     self.ctx.device.free_memory(*memory, None);
                 }
             }
-            if self.mode == PresentMode::Headless {
-                if self.swapchain != vk::SwapchainKHR::null() {
-                    self.ctx
-                        .swapchain_ext
-                        .destroy_swapchain(self.swapchain, None);
-                }
-                if self.surface != vk::SurfaceKHR::null() {
-                    self.ctx.surface_ext.destroy_surface(self.surface, None);
-                }
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.ctx
+                    .swapchain_ext
+                    .destroy_swapchain(self.swapchain, None);
             }
         }
         self.images.clear();
         self.offscreen_memory.clear();
-        self.surface = vk::SurfaceKHR::null();
         self.swapchain = vk::SwapchainKHR::null();
     }
 }
@@ -629,5 +722,50 @@ mod tests {
         let _img = sc.get_buffer(0).expect("buffer 0 must exist");
         // Present must not panic in the offscreen path and must succeed in headless.
         sc.present(0).expect("present should succeed");
+    }
+
+    /// On a host with a real X11 display the swap chain built for a wsi `Window` must
+    /// present to a visible `VkSurfaceKHR` (mode `Windowed`), not degrade to the
+    /// headless path. Skipped on headless hosts (no `DISPLAY`), when `NIGG_HEADLESS`
+    /// is forced, and when Vulkan or window construction is unavailable.
+    #[test]
+    fn create_swap_chain_windowed_on_display() {
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("skipping: no X11 display available");
+            return;
+        }
+        if std::env::var_os("NIGG_HEADLESS").is_some() {
+            eprintln!("skipping: NIGG_HEADLESS forces the headless path");
+            return;
+        }
+        let factory = match Factory::new() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("skipping: no Vulkan available: {e}");
+                return;
+            }
+        };
+        let mut window = match nigg_wsi::Window::new("nigg-dxgi-windowed-test", 256, 128) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("skipping: no window available: {e}");
+                return;
+            }
+        };
+        let desc = SwapChainDesc {
+            width: 256,
+            height: 128,
+            ..SwapChainDesc::default()
+        };
+        let mut sc = factory
+            .create_swap_chain(Some(&window), desc)
+            .expect("windowed swap chain creation should succeed");
+        assert_eq!(sc.present_mode(), PresentMode::Windowed);
+        assert!(sc.buffer_count() >= 1);
+        let img = sc.get_buffer(0).expect("buffer 0 must exist");
+        assert_ne!(img, vk::Image::null());
+        // One present against the real X11 surface must succeed.
+        sc.present(0).expect("present to the window should succeed");
+        let _ = window.poll_event();
     }
 }

@@ -867,6 +867,22 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
+    // Wire in the XInput gamepad (xinput1_3/1_4/9_1_0.dll), XAudio2
+    // (xaudio2_7..10.dll), and DirectInput8 (dinput8.dll) exports — the two
+    // most-complaint-about missing APIs in games. Same dedup pattern.
+    for e in nigg_win32_kernel32::xinput::xinput_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
     // Wire in the TPM 2.0 Base Services (tbs.dll) exports plus the firmware /
     // system-security queries from `nigg-win32-kernel32::tpm` — the surfaces
     // Windows 11-era games and anti-cheat query to verify system integrity:

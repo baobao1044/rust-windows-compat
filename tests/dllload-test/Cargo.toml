@@ -1,0 +1,12 @@
+[workspace]
+members = ["dll", "exe"]
+resolver = "2"
+
+# Both members are `#![no_std]` and avoid the STD unwinding machinery entirely, and the
+# EXE is a `-nostartfiles` PE (see exe/build.rs), so abort-on-panic keeps the link
+# surface minimal in both profiles.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

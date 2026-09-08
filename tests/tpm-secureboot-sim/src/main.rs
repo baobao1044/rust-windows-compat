@@ -34,8 +34,7 @@ const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
 
 /// `{"{8BE4DF61-93CA-11D1-AAEB-00A0C9062958}"}` — EFI global-variable namespace,
 /// ANSI C-string form, as passed to GetFirmwareEnvironmentVariableA.
-const EFI_GLOBAL_VARIABLE_GUID_A: &[u8] =
-    b"{8BE4DF61-93CA-11D1-AAEB-00A0C9062958}\0";
+const EFI_GLOBAL_VARIABLE_GUID_A: &[u8] = b"{8BE4DF61-93CA-11D1-AAEB-00A0C9062958}\0";
 /// `SecureBoot` variable name, ANSI C-string form.
 const SECUREBOOT_NAME_A: &[u8] = b"SecureBoot\0";
 
@@ -50,7 +49,8 @@ unsafe extern "C" {
         size: u32,
     ) -> u32;
     fn IsWow64Process(h: *mut u8, wow64: *mut i32) -> i32;
-    fn GetProductInfo(major: u32, minor: u32, sp_major: u32, sp_minor: u32, ptype: *mut u32) -> i32;
+    fn GetProductInfo(major: u32, minor: u32, sp_major: u32, sp_minor: u32, ptype: *mut u32)
+        -> i32;
 }
 
 #[link(name = "tbs", kind = "raw-dylib")]
@@ -198,7 +198,9 @@ unsafe fn try_run() -> i32 {
             probe_out.as_mut_ptr(),
             &mut cb_result,
         )
-    } != 0 || cb_result != 0 {
+    } != 0
+        || cb_result != 0
+    {
         return 109;
     }
     let mut log_buf: *mut u8 = core::ptr::dangling_mut::<u8>();
@@ -225,7 +227,16 @@ unsafe fn try_run() -> i32 {
     let mut vtype: u32 = 0;
     let mut data = [0u8; 4];
     let mut data_len: u32 = data.len() as u32;
-    let rc = unsafe { RegQueryValueExW(hkey, value_name.as_ptr(), ptr::null_mut(), &mut vtype, data.as_mut_ptr(), &mut data_len) };
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            ptr::null_mut(),
+            &mut vtype,
+            data.as_mut_ptr(),
+            &mut data_len,
+        )
+    };
     let _ = unsafe { RegCloseKey(hkey) };
     if rc != ERROR_SUCCESS || vtype != 4 || data_len != 4 {
         return 113;

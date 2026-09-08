@@ -1,0 +1,19 @@
+[package]
+name = "nigg-dllload-dll"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# A Windows PE cdylib (cross-compiled for x86_64-pc-windows-gnu) that acts as the
+# `LoadLibrary` fixture DLL: it exports three functions (`dll_increment`,
+# `dll_count`, `dll_missing` is deliberately absent) and a real `DllMain`.
+# `nigg_dllload.exe` (the companion EXE) loads it at runtime through
+# `kernel32!LoadLibraryA`, resolves the exports through `kernel32!GetProcAddress`,
+# calls one of them to increment a counter inside the DLL, and verifies the
+# counter changed. Build with:
+#   cargo build --target x86_64-pc-windows-gnu --manifest-path tests/dllload-test/Cargo.toml
+
+[lib]
+name = "nigg_dllload"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
