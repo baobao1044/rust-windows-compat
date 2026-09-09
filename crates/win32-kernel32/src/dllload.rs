@@ -286,8 +286,10 @@ fn read_guest_str_a(name: *const u8) -> Option<String> {
 fn read_guest_str_w(name: *const u16) -> Option<String> {
     let units = guest_cstring(name as *const u8, 2)?;
     let units: Vec<u16> = units
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     Some(String::from_utf16_lossy(&units))
 }
