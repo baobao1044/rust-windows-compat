@@ -46,6 +46,49 @@ pub fn resolve(imports: &[goblin::pe::import::Import], known: &ImplTable) -> Res
         let sym = normalize_symbol(&imp.name);
         if let Some(ptr) = known.lookup(&dll, &sym) {
             out.resolved.insert((dll.clone(), sym.clone()), ptr);
+        } else if dll.starts_with("api-ms-win-crt-") {
+            // api-ms-win-crt-* are Universal CRT API-set pseudo-DLLs. Their
+            // symbols are the same functions we already implement under
+            // ucrtbase.dll. Forward the lookup to ucrtbase.
+            if let Some(ptr) = known.lookup("ucrtbase.dll", &sym) {
+                log::debug!("forwarded {dll}!{sym} → ucrtbase.dll!{sym}");
+                out.resolved.insert((dll.clone(), sym.clone()), ptr);
+                continue;
+            }
+            // Also try msvcrt as a fallback.
+            if let Some(ptr) = known.lookup("msvcrt.dll", &sym) {
+                log::debug!("forwarded {dll}!{sym} → msvcrt.dll!{sym}");
+                out.resolved.insert((dll.clone(), sym.clone()), ptr);
+                continue;
+            }
+            // Fall through to stub.
+            log::warn!(
+                "stubbed import: {}!{} (no implementation; {})",
+                imp.dll,
+                imp.name,
+                if soft { "soft stub" } else { "hard trap" }
+            );
+            out.stubbed.push((dll.clone(), sym.clone()));
+            let stub = if soft { soft_ptr } else { trap_stub as FnPtr };
+            out.resolved.insert((dll.clone(), sym.clone()), stub);
+        } else if dll == "vcruntime140.dll" || dll == "vcruntime140_1.dll" {
+            // VCRUNTIME140.dll symbols are implemented under ntdll.dll (for SEH)
+            // and in our vcruntime module. Try ntdll first, then the table.
+            if let Some(ptr) = known.lookup("ntdll.dll", &sym) {
+                log::debug!("forwarded {dll}!{sym} → ntdll.dll!{sym}");
+                out.resolved.insert((dll.clone(), sym.clone()), ptr);
+                continue;
+            }
+            // Fall through to stub.
+            log::warn!(
+                "stubbed import: {}!{} (no implementation; {})",
+                imp.dll,
+                imp.name,
+                if soft { "soft stub" } else { "hard trap" }
+            );
+            out.stubbed.push((dll.clone(), sym.clone()));
+            let stub = if soft { soft_ptr } else { trap_stub as FnPtr };
+            out.resolved.insert((dll.clone(), sym.clone()), stub);
         } else {
             // Try to resolve from a bundled DLL on disk via LoadLibrary+GetProcAddress.
             // This is the key path for game compatibility: when a game imports from
@@ -1220,6 +1263,23 @@ fn import_specs() -> Vec<ImportSpec> {
     // Wire in d3dcompiler_47.dll (D3DCompile) — bridges to our HLSL→SPIR-V
     // compiler so games can compile HLSL shaders at runtime.
     for e in nigg_win32_kernel32::d3dcompiler::d3d_compiler_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
+    // Wire in VCRUNTIME140.dll + MSVCP140.dll (MSVC C++ runtime). Games and
+    // bundled DLLs (PhysX, lua) import from these for C string/memory functions,
+    // SEH, and C++ exception support. We delegate string/mem functions to libc
+    // and no-op the C++ vtable methods.
+    for e in nigg_win32_kernel32::vcruntime::vcruntime_exports() {
         let key = (e.dll.to_string(), e.sym.to_string());
         if seen.insert(key) {
             specs.push(ImportSpec {

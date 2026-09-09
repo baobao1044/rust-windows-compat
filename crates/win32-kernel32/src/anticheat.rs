@@ -801,6 +801,38 @@ pub fn anticheat_exports() -> Vec<ExportSpec> {
             n_args: 3,
             noreturn: false,
         },
+        // MSVC CRT critical kernel32 functions
+        k!("FlsAlloc", fls_alloc, 1),
+        k!("FlsGetValue", fls_get_value, 1),
+        k!("FlsSetValue", fls_set_value, 2),
+        k!("FlsFree", fls_free, 1),
+        k!("InitializeSListHead", initialize_slist_head, 1),
+        k!("InterlockedPushEntrySList", interlocked_push_entry_slist, 2),
+        k!("InterlockedPopEntrySList", interlocked_pop_entry_slist, 1),
+        k!("InterlockedFlushSList", interlocked_flush_slist, 1),
+        k!(
+            "InitializeCriticalSectionAndSpinCount",
+            initialize_critical_section_and_spin_count,
+            2
+        ),
+        k!("GetModuleHandleExW", get_module_handle_ex_w, 3),
+        k!("UnhandledExceptionFilter", unhandled_exception_filter, 1),
+        k!("IsProcessorFeaturePresent", is_processor_feature_present, 1),
+        k!("RtlPcToFileHeader", rtl_pc_to_file_header, 2),
+        k!("RtlUnwind", rtl_unwind, 4),
+        k!("GetACP", get_acp, 0),
+        k!("GetCPInfo", get_cp_info, 2),
+        k!("IsValidCodePage", is_valid_code_page, 1),
+        k!("LCMapStringW", lc_map_string_w, 6),
+        k!("IsValidLocale", is_valid_locale, 2),
+        k!("GetUserDefaultLCID", get_user_default_lcid, 0),
+        k!("EnumSystemLocalesW", enum_system_locales_w, 2),
+        k!("GetStringTypeW", get_string_type_w, 4),
+        k!("HeapSize", heap_size, 3),
+        k!("TryEnterCriticalSection", try_enter_critical_section, 1),
+        k!("VerSetConditionMask", ver_set_condition_mask, 3),
+        k!("VerifyVersionInfoW", verify_version_info_w, 3),
+        k!("FindFirstFileExW", find_first_file_ex_w, 6),
     ]
 }
 
@@ -1004,4 +1036,204 @@ pub extern "C" fn get_computer_name_w(buf: *mut u16, len: *mut u32) -> c_int {
         *len = needed - 1;
     }
     1
+}
+
+// ---------------------------------------------------------------------------
+// MSVC CRT critical kernel32 functions
+// ---------------------------------------------------------------------------
+
+/// `kernel32!FlsAlloc(callback) -> DWORD`. Fiber Local Storage — like TLS for fibers.
+pub extern "C" fn fls_alloc(_callback: *mut c_void) -> u32 {
+    // Return a fake FLS index (0 is valid on Windows).
+    0
+}
+
+/// `kernel32!FlsGetValue(index) -> PVOID`. Returns NULL (no fiber-local value).
+pub extern "C" fn fls_get_value(_index: u32) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!FlsSetValue(index, value) -> BOOL`. Returns TRUE.
+pub extern "C" fn fls_set_value(_index: u32, _value: *const c_void) -> c_int {
+    1
+}
+
+/// `kernel32!FlsFree(index) -> BOOL`. Returns TRUE.
+pub extern "C" fn fls_free(_index: u32) -> c_int {
+    1
+}
+
+/// `kernel32!InitializeSListHead(list) -> void`. Zero the SLIST_HEADER (8 bytes).
+pub extern "C" fn initialize_slist_head(list: *mut c_void) {
+    if list.is_null() {
+        return;
+    }
+    // SAFETY: caller provides 8-byte aligned SLIST_HEADER.
+    unsafe {
+        std::ptr::write_bytes(list as *mut u8, 0, 16);
+    }
+}
+
+/// `kernel32!InterlockedPushEntrySList(list, entry) -> PSLIST_ENTRY`. Return NULL (empty).
+pub extern "C" fn interlocked_push_entry_slist(
+    _list: *mut c_void,
+    _entry: *mut c_void,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!InterlockedPopEntrySList(list) -> PSLIST_ENTRY`. Return NULL (empty).
+pub extern "C" fn interlocked_pop_entry_slist(_list: *mut c_void) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!InterlockedFlushSList(list) -> PSLIST_ENTRY`. Return NULL (empty).
+pub extern "C" fn interlocked_flush_slist(_list: *mut c_void) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!InitializeCriticalSectionAndSpinCount(cs, spin) -> BOOL`. Returns TRUE.
+pub extern "C" fn initialize_critical_section_and_spin_count(
+    _cs: *mut c_void,
+    _spin: u32,
+) -> c_int {
+    1
+}
+
+/// `kernel32!GetModuleHandleExW(flags, name, module) -> BOOL`. Return NULL module.
+pub extern "C" fn get_module_handle_ex_w(
+    _flags: u32,
+    _name: *const u16,
+    module: *mut *mut c_void,
+) -> c_int {
+    if !module.is_null() {
+        unsafe {
+            *module = std::ptr::null_mut();
+        }
+    }
+    0 // FALSE — module not found
+}
+
+/// `kernel32!UnhandledExceptionFilter(exception) -> LONG`. Return EXCEPTION_CONTINUE_SEARCH (0).
+pub extern "C" fn unhandled_exception_filter(_exception: *mut c_void) -> i32 {
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+/// `kernel32!IsProcessorFeaturePresent(feature) -> BOOL`. Return TRUE for all features.
+pub extern "C" fn is_processor_feature_present(_feature: u32) -> c_int {
+    1
+}
+
+/// `kernel32!RtlPcToFileHeader(pc) -> PVOID`. Return NULL (we don't track module headers).
+pub extern "C" fn rtl_pc_to_file_header(_pc: *const c_void, _header_size: *mut u32) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `kernel32!RtlUnwind(frame, target, record, value) -> void`. No-op.
+pub extern "C" fn rtl_unwind(
+    _frame: *mut c_void,
+    _target: *mut c_void,
+    _record: *mut c_void,
+    _value: *mut c_void,
+) {
+}
+
+/// `kernel32!GetACP() -> UINT`. Return 1252 (Western European).
+pub extern "C" fn get_acp() -> u32 {
+    1252
+}
+
+/// `kernel32!GetCPInfo(codepage, info) -> BOOL`. Fill CPINFO for 1252.
+pub extern "C" fn get_cp_info(_codepage: u32, info: *mut c_void) -> c_int {
+    if info.is_null() {
+        return 0;
+    }
+    // CPINFO is 18 bytes: maxCharSize(4) + defaultChar(2) + leadBytes(12)
+    unsafe {
+        std::ptr::write_bytes(info as *mut u8, 0, 18);
+    }
+    // maxCharSize = 1 for single-byte codepage
+    unsafe {
+        *(info as *mut u32) = 1;
+    }
+    1 // TRUE
+}
+
+/// `kernel32!IsValidCodePage(codepage) -> BOOL`. Return TRUE.
+pub extern "C" fn is_valid_code_page(_codepage: u32) -> c_int {
+    1
+}
+
+/// `kernel32!LCMapStringW(locale, flags, src, src_len, dst, dst_len) -> int`. Return 0.
+pub extern "C" fn lc_map_string_w(
+    _locale: u32,
+    _flags: u32,
+    _src: *const u16,
+    _src_len: c_int,
+    _dst: *mut u16,
+    _dst_len: c_int,
+) -> c_int {
+    0
+}
+
+/// `kernel32!IsValidLocale(locale, flags) -> BOOL`. Return TRUE.
+pub extern "C" fn is_valid_locale(_locale: u32, _flags: u32) -> c_int {
+    1
+}
+
+/// `kernel32!GetUserDefaultLCID() -> LCID`. Return 0x0409 (US English).
+pub extern "C" fn get_user_default_lcid() -> u32 {
+    0x0409
+}
+
+/// `kernel32!EnumSystemLocalesW(callback, flags) -> BOOL`. Return TRUE (no locales).
+pub extern "C" fn enum_system_locales_w(_callback: *mut c_void, _flags: u32) -> c_int {
+    1
+}
+
+/// `kernel32!GetStringTypeW(type, src, count, type_table) -> BOOL`. Return FALSE.
+pub extern "C" fn get_string_type_w(
+    _type: u32,
+    _src: *const u16,
+    _count: c_int,
+    _type_table: *mut u16,
+) -> c_int {
+    0
+}
+
+/// `kernel32!HeapSize(heap, flags, ptr) -> SIZE_T`. Return malloc_usable_size.
+pub extern "C" fn heap_size(_heap: *mut c_void, _flags: u32, ptr: *const c_void) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: malloc_usable_size is safe with a valid pointer.
+    unsafe { libc::malloc_usable_size(ptr as *mut c_void) }
+}
+
+/// `kernel32!TryEnterCriticalSection(cs) -> BOOL`. Return TRUE (acquired).
+pub extern "C" fn try_enter_critical_section(_cs: *mut c_void) -> c_int {
+    1
+}
+
+/// `kernel32!VerSetConditionMask(condition, type, mask) -> ULONGLONG`. Return 0.
+pub extern "C" fn ver_set_condition_mask(_condition: u64, _type: u32, _mask: u8) -> u64 {
+    0
+}
+
+/// `kernel32!VerifyVersionInfoW(info, type, mask) -> BOOL`. Return TRUE (matches).
+pub extern "C" fn verify_version_info_w(_info: *mut c_void, _type: u32, _mask: u64) -> c_int {
+    1
+}
+
+/// `kernel32!FindFirstFileExW(path, info_level, find_data, search_op, filter, flags) -> HANDLE`.
+pub extern "C" fn find_first_file_ex_w(
+    _path: *const u16,
+    _info_level: u32,
+    _find_data: *mut c_void,
+    _search_op: u32,
+    _filter: *mut c_void,
+    _flags: u32,
+) -> *mut c_void {
+    // INVALID_HANDLE_VALUE
+    !0usize as *mut c_void
 }
