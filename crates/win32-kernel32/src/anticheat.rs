@@ -832,13 +832,16 @@ pub extern "C" fn get_system_time_as_file_time(lp_ft: *mut u64) {
     unsafe { *lp_ft = filetime };
 }
 
-/// `ntdll!RtlLookupFunctionEntry(pc, entry, base) -> PRUNTIME_FUNCTION`. Returns NULL.
+/// `ntdll!RtlLookupFunctionEntry(pc, entry, base) -> PRUNTIME_FUNCTION`.
+/// Walks the image's `.pdata` to find the RUNTIME_FUNCTION covering `pc`.
+/// Returns NULL when no function contains the PC (e.g. it's in a jump table
+/// or a non-function data region).
 pub extern "C" fn rtl_lookup_function_entry(
-    _pc: u64,
+    pc: u64,
     _entry: *mut u64,
     _base: *mut u64,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    crate::dllload::call_lookup_function_entry(pc) as *mut c_void
 }
 
 /// `bcrypt!BCryptGenRandom(h, buf, len, flags) -> NTSTATUS`. Fills with random.

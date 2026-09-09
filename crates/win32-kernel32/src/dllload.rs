@@ -51,12 +51,19 @@ pub type GetProcAddressFn = fn(h_module: *mut c_void, name: *const u8) -> *mut c
 /// handle was a registered module.
 pub type FreeLibraryFn = fn(h_module: *mut c_void) -> bool;
 
+/// The registered SEH function-entry lookup: walks the image's `.pdata`
+/// (RUNTIME_FUNCTION array) to find the entry covering `pc`. Returns a
+/// pointer into the mapped image's `.pdata`, or NULL when the PC is not
+/// inside any function. Set by `nigg-pe-loader` at load time.
+pub type LookupFunctionEntryFn = fn(pc: u64) -> *const c_void;
+
 /// The registration slots. `pe-loader` fills them in exactly one place
 /// (`dllmod::register_kernel32_bridge`, called from the load path), so plain `fn`
 /// pointers are enough and the OnceLocks double as an idempotence guard.
 static LOAD_DLL_FN: OnceLock<LoadDllFn> = OnceLock::new();
 static GET_PROC_ADDRESS_FN: OnceLock<GetProcAddressFn> = OnceLock::new();
 static FREE_LIBRARY_FN: OnceLock<FreeLibraryFn> = OnceLock::new();
+static LOOKUP_FN_ENTRY_FN: OnceLock<LookupFunctionEntryFn> = OnceLock::new();
 
 /// Register the real DLL loading functions. Called by `nigg-pe-loader` when the loader
 /// boots (before any guest code runs), breaking the crate dependency cycle.
@@ -71,6 +78,21 @@ pub fn register(
     let _ = GET_PROC_ADDRESS_FN.set(get_proc_address);
     let _ = FREE_LIBRARY_FN.set(free_library);
     log::debug!("kernel32: DLL loading functions registered by the PE loader");
+}
+
+/// Register the SEH function-entry lookup. Called by the PE loader after the main
+/// image is mapped and before the entry point runs, so C++ exception handling
+/// and longjmp inside the guest can find their unwind info.
+pub fn register_lookup_function_entry(f: LookupFunctionEntryFn) {
+    let _ = LOOKUP_FN_ENTRY_FN.set(f);
+}
+
+/// Call the registered SEH lookup, if installed; NULL otherwise.
+pub fn call_lookup_function_entry(pc: u64) -> *const c_void {
+    match LOOKUP_FN_ENTRY_FN.get() {
+        Some(f) => f(pc),
+        None => std::ptr::null(),
+    }
 }
 
 // ---------------------------------------------------------------------------

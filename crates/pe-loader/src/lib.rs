@@ -27,6 +27,7 @@
 mod dllmod;
 mod imports;
 mod mapping;
+mod seh;
 mod teb;
 mod thunk;
 mod tls;
@@ -188,6 +189,30 @@ pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
         .finalize()
         .map_err(|e| LoadError::Bootstrap(format!("thunk arena seal: {e}")))?;
 
+    // Install the SEH exception-table lookup so `RtlLookupFunctionEntry` (which
+    // C++ exception handling, longjmp, and anti-cheat integrity checks call)
+    // can find the `RUNTIME_FUNCTION` for any PC inside the image. The exception
+    // table is DataDirectory[3] in the optional header; its entries are 12-byte
+    // `RUNTIME_FUNCTION` structs (BeginRVA, EndRVA, UnwindRVA), sorted by
+    // BeginAddress and non-overlapping.
+    if let Some(exc_dir) = opt.data_directories.get_exception_table() {
+        let pdata_rva = exc_dir.virtual_address as usize;
+        let pdata_size = exc_dir.size as usize;
+        if pdata_rva > 0 && pdata_size >= 12 && pdata_rva + pdata_size <= mapped.size {
+            let count = pdata_size / 12;
+            // SAFETY: `pdata_rva + pdata_size` is within the mapped image
+            // (checked above), and the image is mapped RWX/RX at this point.
+            let pdata_base = unsafe { mapped.base.add(pdata_rva) } as *const seh::RuntimeFunction;
+            // SAFETY: the image stays mapped for the process lifetime (it's the
+            // main EXE, owned by the returned PeImage), so the pointer is stable.
+            unsafe { seh::install(pdata_base, count, mapped.base as usize, mapped.size) };
+            nigg_win32_kernel32::dllload::register_lookup_function_entry(seh_proxy);
+            log::debug!(
+                "pe-loader: SEH exception table installed ({count} RUNTIME_FUNCTION entries at RVA {pdata_rva:#x})"
+            );
+        }
+    }
+
     // Build the TEB/PEB. Use the guest stack's bounds for the TIB StackBase/StackLimit so
     // `gs:[0x08]`/`gs:[0x10]` describe the same stack we'll run on.
     let stack =
@@ -258,6 +283,13 @@ fn stack_usable() -> usize {
     // Mirrors nigg_runtime::Stack's default: 1 MiB usable + 4 KiB guard. We subtract the
     // guard to report the usable span for the TIB StackLimit.
     1 << 20
+}
+
+/// Proxy matching `dllload::LookupFunctionEntryFn`: delegates to `seh::lookup_function_entry`
+/// so the kernel32-side `RtlLookupFunctionEntry` stub can reach the PE loader's exception
+/// table without a reverse dependency.
+fn seh_proxy(pc: u64) -> *const std::os::raw::c_void {
+    seh::lookup_function_entry(pc)
 }
 
 // ---------------------------------------------------------------------------
