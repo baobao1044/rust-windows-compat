@@ -67,5 +67,31 @@ docs/               architecture & compatibility matrix
 
 ## Status
 
-Pre-alpha. See [docs/architecture.md](docs/architecture.md) and
-[docs/compatibility.md](docs/compatibility.md).
+Pre-alpha, 270 tests passing. Verified end-to-end through `nigg-loader`:
+
+| Fixture | Result |
+|---------|--------|
+| `hello.exe` — Rust std console PE (180 imports) | exits 0, prints to stdout |
+| `d3d11_sample.exe` — D3D11 clear + present | exits 0 |
+| `d3d11_triangle.exe` — D3D11 draw with HLSL shaders | exits 0 |
+| `d3d12_sample.exe` — D3D12 command-list pipeline | exits 0 |
+| `game_window.exe` — user32 window + D3D11 swap chain | exits 0 |
+| `dllload_test.exe` — LoadLibrary + GetProcAddress + DllMain | exits 0 |
+| `anticheat_sim.exe` — userland anti-cheat init sequence | exits 0 |
+| `tpm_secureboot_sim.exe` — TPM 2.0 + Secure Boot probes | exits 0 |
+| **`notepad.exe`** — real Windows x64 binary | 0 stubbed imports, opens a real X11 window |
+| `cmd.exe` — real Windows x64 binary | 0 stubbed imports, starts executing |
+
+Roughly 370 API exports are implemented across kernel32, user32, gdi32, ntdll,
+ucrtbase/msvcrt, advapi32, shell32, shlwapi, ws2_32, xinput/xaudio2/dinput8, and
+the D3D11/D3D12/DXGI COM vtables.
+
+The north star (M9 — a modern game with anti-cheat) is **not** reached and remains
+multi-year work. See [docs/compatibility.md](docs/compatibility.md) for the honest
+matrix and [docs/anti-cheat.md](docs/anti-cheat.md) for what is and is not possible.
+
+See also [docs/architecture.md](docs/architecture.md).
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
