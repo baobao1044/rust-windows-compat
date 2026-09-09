@@ -255,23 +255,39 @@ fn try_map_at(preferred: usize, size: usize) -> Option<*mut u8> {
     if preferred == 0 {
         return None;
     }
-    // SAFETY: `MAP_FIXED` with `addr != 0` requests a specific address. If it fails we
-    // return None; if it succeeds we own a `size`-byte anonymous mapping at `preferred`.
+    // `MAP_FIXED_NOREPLACE` (Linux 4.17+) fails with EEXIST when the range is already
+    // mapped, instead of silently *unmapping* whatever lives there the way plain
+    // `MAP_FIXED` does. That distinction matters: two images loaded concurrently share
+    // the same preferred base (0x140000000 for a default-linked PE), and with
+    // `MAP_FIXED` the second load would rip the first one's image out from under it —
+    // the first then faults on its own headers. On EEXIST we return `None` and the
+    // caller relocates to a kernel-chosen address.
+    //
+    // SAFETY: anonymous private mapping at a caller-supplied address. On success we own
+    // `size` bytes at exactly `preferred` (the kernel never relocates us silently,
+    // because a kernel too old to know the flag would ignore it — see the guard below).
     let p = unsafe {
         libc::mmap(
             preferred as *mut c_void,
             size,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
             -1,
             0,
         )
     };
     if p == libc::MAP_FAILED {
-        None
-    } else {
-        Some(p as *mut u8)
+        return None;
     }
+    if p as usize != preferred {
+        // Pre-4.17 kernels ignore the flag and fall back to a hint, which would hand us
+        // a different address than the one the caller asked to pin. Release it and let
+        // the caller take the relocating path explicitly.
+        // SAFETY: `p` is the mapping we just created and have not handed out.
+        unsafe { libc::munmap(p, size) };
+        return None;
+    }
+    Some(p as *mut u8)
 }
 
 /// Translate section characteristics into `mprotect` prot flags.

@@ -79,6 +79,12 @@ pub struct ThunkArena {
     cursor: usize,
     /// `true` once the arena has been flipped to PROT_EXEC (no more writes allowed).
     sealed: bool,
+    /// Mappings retired by [`ThunkArena::grow`]. They stay mapped (and are sealed
+    /// and unmapped alongside the live block) because thunk pointers already handed
+    /// out point into them: an IAT slot or COM vtable entry emitted before a growth
+    /// still holds the old address. Releasing a retired block would dangle every one
+    /// of those and fault the moment the guest calls through it.
+    retired: Vec<(*mut u8, usize)>,
 }
 
 // SAFETY: the arena owns its mapping and the thunks are plain code blobs with no shared
@@ -121,6 +127,7 @@ impl ThunkArena {
             len,
             cursor: 0,
             sealed: false,
+            retired: Vec::new(),
         })
     }
 
@@ -169,20 +176,24 @@ impl ThunkArena {
         if self.sealed {
             return Ok(());
         }
-        // SAFETY: `base..base+len` is the whole owned mapping, page-aligned; mprotect
-        // requires page-aligned address+length.
-        let rc = unsafe {
-            libc::mprotect(
-                self.base as *mut libc::c_void,
-                self.len,
-                libc::PROT_READ | libc::PROT_EXEC,
-            )
-        };
-        if rc != 0 {
-            return Err(ThunkError::ExecFailed {
-                size: self.len,
-                msg: errno_str(),
-            });
+        // Seal every block we own — the retired ones still hold live thunks, so they
+        // need PROT_EXEC too, not just the current block.
+        for (base, len) in self.retired.iter().copied().chain([(self.base, self.len)]) {
+            // SAFETY: each `(base, len)` is a whole page-aligned mapping this arena
+            // owns; mprotect requires a page-aligned address and length.
+            let rc = unsafe {
+                libc::mprotect(
+                    base as *mut libc::c_void,
+                    len,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                )
+            };
+            if rc != 0 {
+                return Err(ThunkError::ExecFailed {
+                    size: len,
+                    msg: errno_str(),
+                });
+            }
         }
         self.sealed = true;
         Ok(())
@@ -198,12 +209,14 @@ impl ThunkArena {
             });
         }
         // Align each thunk to 16 bytes so the code starts on a clean boundary.
-        let aligned = round_up(self.cursor, 16);
-        let end = aligned + n;
-        if end > self.len {
-            self.grow(end)?;
+        let mut aligned = round_up(self.cursor, 16);
+        if aligned + n > self.len {
+            // `grow` retires the current block and installs a fresh one with the
+            // cursor reset, so the offset must be recomputed against the new block.
+            self.grow(aligned + n)?;
+            aligned = round_up(self.cursor, 16);
         }
-        self.cursor = end;
+        self.cursor = aligned + n;
         Ok(aligned)
     }
 
@@ -229,14 +242,14 @@ impl ThunkArena {
                 msg: errno_str(),
             });
         }
-        // SAFETY: copy the already-emitted code from the old mapping into the new one,
-        // then release the old mapping. `self.cursor` bytes are valid in the old mapping.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.base, new_base as *mut u8, self.cursor);
-            libc::munmap(self.base as *mut libc::c_void, self.len);
-        }
+        // Retire the old block instead of unmapping it: thunk pointers already handed
+        // out (IAT slots, COM vtable entries) point into it, so releasing it would
+        // dangle them. We do NOT copy the emitted code forward — the retired mapping
+        // stays live at its original addresses, and the new block starts empty.
+        self.retired.push((self.base, self.len));
         self.base = new_base as *mut u8;
         self.len = new_len;
+        self.cursor = 0;
         // After growth the arena is RW again; the caller (finalize) re-applies PROT_EXEC.
         self.sealed = false;
         Ok(())
@@ -245,11 +258,16 @@ impl ThunkArena {
 
 impl Drop for ThunkArena {
     fn drop(&mut self) {
-        // SAFETY: `base`/`len` describe the mapping we own; unmap exactly once. If `grow`
-        // already unmapped a previous mapping, `base`/`len` point at the current one.
-        if !self.base.is_null() {
+        // Release the live block and every block retired by `grow`. Each is unmapped
+        // exactly once; the arena is the sole owner and the guest is gone by now.
+        for (base, len) in self.retired.iter().copied().chain([(self.base, self.len)]) {
+            if base.is_null() {
+                continue;
+            }
+            // SAFETY: `(base, len)` describes a mapping this arena created and has not
+            // unmapped yet.
             unsafe {
-                libc::munmap(self.base as *mut libc::c_void, self.len);
+                libc::munmap(base as *mut libc::c_void, len);
             }
         }
     }
@@ -586,5 +604,43 @@ mod tests {
         arena.finalize().expect("seal twice is a no-op");
         // After sealing, emitting another thunk must fail.
         assert!(arena.make_thunk(echo_first as *const c_void, 1).is_err());
+    }
+
+    /// Thunks emitted before the arena grows must stay callable afterwards.
+    ///
+    /// `grow` used to `munmap` the outgrown block, which dangled every pointer
+    /// already written into an IAT slot or COM vtable — the guest then faulted the
+    /// first time it called one of them. With ~370 registered exports plus the COM
+    /// vtable slots, `ImplTable::build` overruns the 32 KiB initial capacity, so
+    /// this was reachable on every real load, and it showed up as an intermittent
+    /// SIGSEGV in the parallel test run.
+    #[test]
+    fn thunks_survive_arena_growth() {
+        // One page, so a handful of thunks forces several growths.
+        let mut arena = ThunkArena::with_capacity(4096).expect("arena");
+        let first = arena
+            .make_thunk(add_four as *const c_void, 4)
+            .expect("first thunk");
+
+        let mut thunks = vec![first];
+        for _ in 0..400 {
+            thunks.push(
+                arena
+                    .make_thunk(add_four as *const c_void, 4)
+                    .expect("thunk after growth"),
+            );
+        }
+        assert!(
+            !arena.retired.is_empty(),
+            "test did not actually trigger a growth; raise the thunk count"
+        );
+
+        arena.finalize().expect("seal all blocks");
+
+        // Every thunk — including the ones in retired blocks — must still execute.
+        for (i, t) in thunks.iter().enumerate() {
+            let r = call_thunk_win64(*t, &[1, 2, 3, 4]);
+            assert_eq!(r, 10, "thunk {i} at {t:p} did not survive arena growth");
+        }
     }
 }
