@@ -59,6 +59,7 @@ pub mod extras;
 pub mod extras2;
 pub mod file;
 pub mod heap;
+pub mod ole32;
 pub mod process;
 pub mod registry;
 pub mod shell32;
