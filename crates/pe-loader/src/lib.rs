@@ -174,6 +174,10 @@ pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
     // Map sections and apply per-section permissions.
     let mapped = mapping::map_image(bytes, &pe)?;
 
+    // Register the actual mapped base so GetModuleHandleW(NULL) returns the
+    // correct handle — the game's CRT calls this during init to find itself.
+    nigg_win32_kernel32::process::register_exe_base(mapped.base as usize);
+
     // Apply base relocations if the image was loaded at a different base than preferred.
     if let Some(reloc_dir) = opt.data_directories.get_base_relocation_table() {
         mapping::apply_relocations(&mapped, bytes, &pe, *reloc_dir)?;

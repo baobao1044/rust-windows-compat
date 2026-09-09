@@ -21,8 +21,21 @@ use crate::{Handle, Hmodule};
 /// for `GetModuleHandle(NULL)`. Real Windows returns the EXE's mapped image base; the
 /// loader sets the PEB `ImageBaseAddress` to the actual mapped base, so a guest that reads
 /// the PEB gets the truth. This stub covers the `GetModuleHandle(NULL)` path until we wire
-/// the loader to publish the mapped base here too.
-const EXE_BASE: usize = 0x0001_4000_0000_0000;
+/// The actual mapped base of the main EXE. Set by the PE loader at load time
+/// via [`register_exe_base`]. Falls back to the default PE image base
+/// (0x140000000) when not set (bare unit tests).
+static EXE_BASE: OnceLock<usize> = OnceLock::new();
+
+/// Register the actual mapped base of the main EXE so GetModuleHandleW and
+/// GetModuleHandleA can return the correct handle. Called by the PE loader
+/// after mapping the image.
+pub fn register_exe_base(base: usize) {
+    let _ = EXE_BASE.set(base);
+}
+
+fn exe_base() -> usize {
+    *EXE_BASE.get().unwrap_or(&0x1_4000_0000)
+}
 
 /// `kernel32!GetCurrentProcessId() -> DWORD`. Delegates to ntapi.
 pub extern "C" fn get_current_process_id() -> u32 {
@@ -61,12 +74,18 @@ pub extern "C" fn get_module_handle_a(module_name: *const u8) -> Hmodule {
 /// "current module" request) returns the EXE base.
 fn resolve_module_handle(name: &str) -> Hmodule {
     if name.is_empty() {
-        return EXE_BASE as Hmodule;
+        return exe_base() as Hmodule;
     }
     match name.to_lowercase().as_str() {
-        "kernel32.dll" | "kernel32" => (EXE_BASE + 0x1000) as Hmodule,
-        "ntdll.dll" | "ntdll" => (EXE_BASE + 0x2000) as Hmodule,
-        "kernelbase.dll" | "kernelbase" => (EXE_BASE + 0x3000) as Hmodule,
+        "kernel32.dll" | "kernel32" => (exe_base() + 0x1000) as Hmodule,
+        "ntdll.dll" | "ntdll" => (exe_base() + 0x2000) as Hmodule,
+        "kernelbase.dll" | "kernelbase" => (exe_base() + 0x3000) as Hmodule,
+        // api-ms-win-* pseudo-DLLs are aliases for kernel32 functions. Return
+        // the kernel32 handle so GetProcAddress can resolve through it.
+        n if n.starts_with("api-ms-win-") => (exe_base() + 0x1000) as Hmodule,
+        "user32.dll" | "user32" => (exe_base() + 0x4000) as Hmodule,
+        "gdi32.dll" | "gdi32" => (exe_base() + 0x5000) as Hmodule,
+        "advapi32.dll" | "advapi32" => (exe_base() + 0x6000) as Hmodule,
         _ => std::ptr::null_mut(),
     }
 }
@@ -132,14 +151,14 @@ mod tests {
     #[test]
     fn module_handle_null_is_exe_base() {
         let h = get_module_handle_w(std::ptr::null());
-        assert_eq!(h as usize, EXE_BASE);
+        assert_eq!(h as usize, exe_base());
     }
 
     #[test]
     fn module_handle_kernel32_is_stable() {
         let name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
         let h = get_module_handle_w(name.as_ptr());
-        assert_eq!(h as usize, EXE_BASE + 0x1000);
+        assert_eq!(h as usize, exe_base() + 0x1000);
     }
 
     #[test]

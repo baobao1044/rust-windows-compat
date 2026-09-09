@@ -449,7 +449,7 @@ impl ImplTable {
         }
     }
 
-    fn lookup(&self, dll: &str, sym: &str) -> Option<FnPtr> {
+    pub(crate) fn lookup(&self, dll: &str, sym: &str) -> Option<FnPtr> {
         self.map.get(&(dll.to_string(), sym.to_string())).copied()
     }
 }

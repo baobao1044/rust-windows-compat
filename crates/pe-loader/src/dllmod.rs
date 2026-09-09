@@ -260,10 +260,73 @@ pub fn load_dll_ex(path: &Path, run_dll_main: bool) -> Result<*mut c_void, LoadE
 /// exports of the module with handle `h_module` and return the export's real Win64 code
 /// address (`base + RVA`). Returns NULL when the module is unknown, the name is absent,
 /// or the address cannot be resolved.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn get_proc_address(h_module: *mut c_void, name: *const u8) -> *mut c_void {
     if h_module.is_null() {
         return std::ptr::null_mut();
     }
+
+    // Check if this is a fake handle from GetModuleHandleW (EXE_BASE + offset).
+    // These represent known DLLs we implement ourselves — resolve through the
+    // import table built by ImplTable::build.
+    const EXE_BASE: usize = 0x1_4000_0000;
+    let handle_val = h_module as usize;
+    if (EXE_BASE..EXE_BASE + 0x10000).contains(&handle_val) {
+        // This is a known-DLL fake handle. Resolve the symbol through our
+        // ImplTable instead of walking a real export directory.
+        let dll_name = match handle_val - EXE_BASE {
+            0 => "kernel32.dll", // EXE base — not a real DLL
+            0x1000 => "kernel32.dll",
+            0x2000 => "ntdll.dll",
+            0x3000 => "kernel32.dll", // kernelbase → kernel32
+            0x4000 => "user32.dll",
+            0x5000 => "gdi32.dll",
+            0x6000 => "advapi32.dll",
+            _ => "kernel32.dll", // default for api-ms-win-* pseudo-DLLs
+        };
+
+        // Read the symbol name from guest memory.
+        let sym_str = if (name as usize) < 0x1_0000 {
+            // Ordinal import — not supported for fake handles.
+            return std::ptr::null_mut();
+        } else {
+            // SAFETY: `name` is a NUL-terminated C string in guest memory.
+            let mut bytes = Vec::new();
+            let mut i = 0;
+            unsafe {
+                while *name.add(i) != 0 && i < 256 {
+                    bytes.push(*name.add(i));
+                    i += 1;
+                }
+            }
+            match std::ffi::CString::new(&bytes[..]) {
+                Ok(cstr) => cstr,
+                Err(_) => return std::ptr::null_mut(),
+            }
+        };
+        let sym_str = sym_str.to_string_lossy().into_owned();
+
+        // Build a fresh ImplTable and look up the symbol.
+        // This is not ideal (rebuilds the table each call) but GetProcAddress
+        // on these fake handles is rare — mainly during CRT init.
+        let mut arena = crate::thunk::ThunkArena::with_capacity(32 * 1024)
+            .expect("thunk arena for GetProcAddress bridge");
+        let table = crate::imports::ImplTable::build(&mut arena);
+        arena.finalize().expect("seal thunk arena");
+        if let Some(ptr) = table.lookup(dll_name, &sym_str) {
+            log::debug!(
+                "GetProcAddress: resolved {dll_name}!{sym_str} from ImplTable (fake handle {handle_val:#x})"
+            );
+            // Keep the arena alive — leak it so the thunk stays valid.
+            std::mem::forget(arena);
+            return ptr as *mut c_void;
+        }
+        log::debug!(
+            "GetProcAddress: {dll_name}!{sym_str} not found in ImplTable (fake handle {handle_val:#x})"
+        );
+        return std::ptr::null_mut();
+    }
+
     let Some(module) = find_by_handle(h_module) else {
         log::warn!(
             "GetProcAddress on unknown module handle {:#x}",
