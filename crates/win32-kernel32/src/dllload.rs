@@ -262,6 +262,11 @@ pub fn register_exe_dir(dir: PathBuf) {
     let _ = EXE_DIR.set(dir);
 }
 
+/// Return the registered EXE directory, if set.
+pub fn get_exe_dir() -> Option<PathBuf> {
+    EXE_DIR.get().cloned()
+}
+
 fn search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     // 1. The main EXE's directory — Windows always searches here first for

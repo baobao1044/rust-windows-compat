@@ -47,6 +47,17 @@ pub fn resolve(imports: &[goblin::pe::import::Import], known: &ImplTable) -> Res
         if let Some(ptr) = known.lookup(&dll, &sym) {
             out.resolved.insert((dll.clone(), sym.clone()), ptr);
         } else {
+            // Try to resolve from a bundled DLL on disk via LoadLibrary+GetProcAddress.
+            // This is the key path for game compatibility: when a game imports from
+            // PhysX_64.dll, lua-5.4.4.dll, assimp-vc143-mt.dll, etc., those DLLs ship
+            // alongside the .exe. We load them for real and resolve their exports.
+            let disk_ptr = try_resolve_from_disk(imp.dll, &sym);
+            if let Some(ptr) = disk_ptr {
+                log::debug!("resolved import: {}!{} from bundled DLL", imp.dll, imp.name);
+                out.resolved.insert((dll.clone(), sym.clone()), ptr);
+                continue;
+            }
+
             log::warn!(
                 "stubbed import: {}!{} (no implementation; {})",
                 imp.dll,
@@ -59,6 +70,130 @@ pub fn resolve(imports: &[goblin::pe::import::Import], known: &ImplTable) -> Res
         }
     }
     out
+}
+
+/// Try to resolve a symbol from a bundled DLL on disk.
+///
+/// Uses `LoadLibrary` + `GetProcAddress` to find the real export. The DLL search
+/// path (EXE dir → $NIGG_DLL_PATH → cwd) finds bundled DLLs like PhysX_64.dll.
+/// The returned pointer is the real Win64 code address inside the loaded DLL —
+/// no thunk needed because the DLL's own code is already Win64 ABI.
+fn try_resolve_from_disk(dll_name: &str, sym: &str) -> Option<FnPtr> {
+    // Only try for DLLs we don't implement ourselves (i.e. not kernel32, user32, etc.)
+    let our_dlls = [
+        "kernel32.dll",
+        "user32.dll",
+        "gdi32.dll",
+        "ntdll.dll",
+        "advapi32.dll",
+        "shell32.dll",
+        "shlwapi.dll",
+        "ole32.dll",
+        "oleaut32.dll",
+        "ws2_32.dll",
+        "d3d11.dll",
+        "dxgi.dll",
+        "d3d12.dll",
+        "d3dcompiler_47.dll",
+        "xinput1_3.dll",
+        "xinput1_4.dll",
+        "xinput9_1_0.dll",
+        "xaudio2_7.dll",
+        "xaudio2_8.dll",
+        "xaudio2_9.dll",
+        "xaudio2_10.dll",
+        "dinput8.dll",
+        "comdlg32.dll",
+        "comctl32.dll",
+        "msvcrt.dll",
+        "ucrtbase.dll",
+        "tbs.dll",
+        "imm32.dll",
+        "bcrypt.dll",
+        "crypt32.dll",
+        "ncrypt.dll",
+        "iphlpapi.dll",
+        "gdiplus.dll",
+    ];
+    let dll_lower = dll_name.to_lowercase();
+    if our_dlls.contains(&dll_lower.as_str()) {
+        return None;
+    }
+
+    // Build the search path candidates using the same logic as LoadLibrary,
+    // but load directly with run_dll_main=false to avoid DllMain failures
+    // (the DLL's own imports may have stubs that crash DllMain).
+    use std::path::Path;
+    let normalized = dll_name.replace('\\', "/");
+    let candidates: Vec<String> = if normalized.contains('/') {
+        let has_ext = normalized.len() >= 4
+            && normalized[normalized.len() - 4..].eq_ignore_ascii_case(".dll");
+        let mut v = vec![normalized.clone()];
+        if !has_ext {
+            v.push(format!("{normalized}.dll"));
+        }
+        v
+    } else {
+        let mut v = Vec::new();
+        let dirs: Vec<std::path::PathBuf> = {
+            let mut d = Vec::new();
+            // EXE dir (registered by the loader)
+            if let Some(exe_dir) = nigg_win32_kernel32::dllload::get_exe_dir() {
+                d.push(exe_dir);
+            }
+            // $NIGG_DLL_PATH
+            if let Some(list) = std::env::var_os("NIGG_DLL_PATH") {
+                d.extend(
+                    list.to_string_lossy()
+                        .split([':', ';'])
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from),
+                );
+            }
+            // cwd
+            d.push(std::path::PathBuf::from("."));
+            d
+        };
+        for dir in &dirs {
+            let joined = dir.join(&normalized);
+            let s = joined.to_string_lossy().into_owned();
+            let has_ext = s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(".dll");
+            v.push(s.clone());
+            if !has_ext {
+                v.push(format!("{s}.dll"));
+            }
+        }
+        v
+    };
+
+    for path_str in &candidates {
+        let path = Path::new(path_str);
+        if !path.exists() {
+            continue;
+        }
+        // Load the DLL without running DllMain — the exports exist in mapped
+        // memory regardless of whether DllMain ran. Running DllMain would fail
+        // because the DLL's own imports (kernel32, etc.) have stubs.
+        match crate::dllmod::load_dll_ex(path, false) {
+            Ok(hmodule) => {
+                log::debug!("loaded bundled DLL {dll_name} from {path_str} (hmodule={hmodule:p}, DllMain skipped)");
+                // GetProcAddress: try by name first, then by ordinal.
+                let sym_cstr = std::ffi::CString::new(sym).ok()?;
+                let ptr = nigg_win32_kernel32::dllload::get_proc_address(
+                    hmodule,
+                    sym_cstr.as_ptr() as *const u8,
+                );
+                if !ptr.is_null() {
+                    log::debug!("resolved {dll_name}!{sym} from bundled DLL at {ptr:p}");
+                    return Some(ptr as FnPtr);
+                }
+            }
+            Err(e) => {
+                log::debug!("failed to load bundled DLL {path_str}: {e}");
+            }
+        }
+    }
+    None
 }
 
 /// Whether "soft stubs" are enabled: unknown imports get a no-op that logs once and returns 0
