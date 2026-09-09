@@ -21,6 +21,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install native deps
         run: |
+          # The hosted runner image ships third-party apt sources (Chrome, Azure CLI)
+          # that intermittently serve a Packages.gz whose hash does not match their
+          # Release file, which makes `apt-get update` exit non-zero and fails the job
+          # before any of our code is touched. We only need packages from the Ubuntu
+          # archive, so drop those sources first.
+          sudo rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
           sudo apt-get update
           sudo apt-get install -y mingw-w64 \
             libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
