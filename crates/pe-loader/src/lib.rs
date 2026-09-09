@@ -29,6 +29,7 @@ mod imports;
 mod mapping;
 mod teb;
 mod thunk;
+mod tls;
 
 pub use dllmod::{free_library, get_proc_address, load_dll};
 
@@ -66,6 +67,12 @@ pub struct PeImage {
     /// The executable thunk arena holding the Win64->SysV trampolines the IAT points at.
     /// Kept alive for the lifetime of `PeImage` so the trampoline code stays mapped.
     _thunk_arena: ThunkArena,
+    /// The static-TLS block `TEB.ThreadLocalStoragePointer` refers to. Held here so the
+    /// allocation outlives every guest thread-local access; dropping it early would
+    /// dangle `gs:[0x58]`.
+    _tls_block: Option<tls::TlsBlock>,
+    /// TLS callbacks to invoke (with `DLL_PROCESS_ATTACH`) before the entry point.
+    tls_callbacks: Vec<*const ()>,
 }
 
 impl PeImage {
@@ -84,6 +91,25 @@ impl PeImage {
         // Set the gs base to the TEB so `gs:[...]` reads land in our TEB.
         nigg_runtime::set_thread_gs_base(self._teb_peb.teb_ptr())
             .map_err(|e| LoadError::Bootstrap(e.to_string()))?;
+
+        // Run TLS callbacks with DLL_PROCESS_ATTACH before the entry point. Windows
+        // does this for every image with an IMAGE_TLS_DIRECTORY; MSVC CRT thread-state
+        // init lives here, and so does some of the earliest userland anti-cheat setup,
+        // so this has to precede the entry point — never skip it.
+        for &cb in &self.tls_callbacks {
+            // SAFETY: every callback VA was bounds-checked against the image in
+            // `collect_callbacks` and points into the executable code section; the
+            // guest stack is fresh and aligned; `h_module` is the live image base.
+            unsafe {
+                nigg_runtime::run_dll_main_win64(
+                    cb,
+                    self._stack.top(),
+                    self.mapped.base as *mut (),
+                    tls::DLL_PROCESS_ATTACH,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
 
         // Call the entrypoint with the Windows x64 ABI: RCX = PEB pointer, RDX = 0, with a
         // 32-byte shadow space on the guest stack. The entrypoint reads the PEB via
@@ -170,7 +196,48 @@ pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
     // (above the guard page). We approximate StackLimit as the bottom of the usable region.
     let stack_base = stack.top() as usize;
     let stack_limit = stack_base.saturating_sub(stack_usable());
-    let teb_peb = TebPeb::new(stack_base, stack_limit, mapped.base as usize);
+    let mut teb_peb = TebPeb::new(stack_base, stack_limit, mapped.base as usize);
+
+    // Set up static TLS and collect the TLS callbacks, when the image declares a TLS
+    // directory. MSVC-linked binaries put CRT thread-state init there and Windows runs
+    // it before the entry point, so this has to happen at load time, not on first use.
+    let (tls_block, tls_callbacks) = match opt.data_directories.get_tls_table() {
+        Some(tls_dir) if tls_dir.virtual_address != 0 => {
+            // SAFETY: the image is mapped and relocated by now, and `read_tls_directory`
+            // bounds-checks the RVA against the mapping size.
+            let parsed = unsafe {
+                tls::read_tls_directory(mapped.base, mapped.size, tls_dir.virtual_address)
+            };
+            match parsed {
+                Ok(dir) => {
+                    let image_base = mapped.base as u64;
+                    // SAFETY: `dir` was parsed from this same mapped image; the index slot
+                    // it names lives in a writable data section.
+                    let block =
+                        unsafe { tls::init_static_tls(mapped.base, mapped.size, image_base, &dir) }
+                            .map_err(|e| LoadError::Bootstrap(format!("static TLS setup: {e}")))?;
+                    // SAFETY: same image and directory.
+                    let cbs = unsafe {
+                        tls::collect_callbacks(mapped.base, mapped.size, image_base, &dir)
+                    };
+                    teb_peb.set_tls_pointer(block.teb_tls_pointer());
+                    log::debug!(
+                        "pe-loader: static TLS ready ({} bytes, {} callback(s))",
+                        dir.block_size(),
+                        cbs.len()
+                    );
+                    (Some(block), cbs)
+                }
+                Err(e) => {
+                    // A malformed TLS directory is not worth failing the load over: an
+                    // image that never touches thread-locals still runs fine without it.
+                    log::warn!("pe-loader: ignoring unusable TLS directory: {e}");
+                    (None, Vec::new())
+                }
+            }
+        }
+        _ => (None, Vec::new()),
+    };
 
     let entry_rva = opt.standard_fields.address_of_entry_point as u32;
 
@@ -181,6 +248,8 @@ pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
         _teb_peb: teb_peb,
         _stack: stack,
         _thunk_arena: thunk_arena,
+        _tls_block: tls_block,
+        tls_callbacks,
     })
 }
 

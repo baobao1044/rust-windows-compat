@@ -29,6 +29,11 @@ use std::alloc::Layout;
 pub const TIB_SELF_OFFSET: usize = 0x30;
 /// The PEB pointer offset within the TEB (`gs:[0x60]`).
 pub const TEB_PEB_OFFSET: usize = 0x60;
+/// `TEB.ThreadLocalStoragePointer` (`gs:[0x58]`) — points at the per-thread array
+/// of static-TLS blocks. Code generated for `__declspec(thread)` reads this slot,
+/// indexes it with the module's TLS index, and dereferences, so it must be a live
+/// pointer before any guest code with static TLS runs.
+pub const TEB_TLS_POINTER_OFFSET: usize = 0x58;
 
 /// A page-aligned, heap-allocated TEB + PEB pair for a guest thread.
 ///
@@ -107,6 +112,23 @@ impl TebPeb {
     /// The address to install as the `gs` base (the TEB start).
     pub fn teb_ptr(&self) -> *mut () {
         self.base as *mut ()
+    }
+
+    /// Publish the static-TLS array into `TEB.ThreadLocalStoragePointer`
+    /// (`gs:[0x58]`).
+    ///
+    /// `tls_pointer` must stay valid for as long as guest code can run: the guest
+    /// dereferences this slot on every `__declspec(thread)` access, so the caller
+    /// keeps the owning `TlsBlock` alive alongside the image.
+    pub fn set_tls_pointer(&mut self, tls_pointer: *mut std::os::raw::c_void) {
+        // SAFETY: `base` is a live, zeroed 4096-byte TEB page; offset 0x58 is well
+        // inside it.
+        unsafe {
+            write_u64(
+                self.base as usize + TEB_TLS_POINTER_OFFSET,
+                tls_pointer as u64,
+            )
+        };
     }
 
     /// The PEB address (for completeness; usually read by guest code via `gs:[0x60]`).
