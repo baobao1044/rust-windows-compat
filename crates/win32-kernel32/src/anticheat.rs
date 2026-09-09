@@ -833,6 +833,10 @@ pub fn anticheat_exports() -> Vec<ExportSpec> {
         k!("VerSetConditionMask", ver_set_condition_mask, 3),
         k!("VerifyVersionInfoW", verify_version_info_w, 3),
         k!("FindFirstFileExW", find_first_file_ex_w, 6),
+        k!("GetTempPath2W", get_temp_path2_w, 2),
+        k!("GetCurrentPackageId", get_current_package_id, 2),
+        k!("GetTempFileNameA", get_temp_filename_a, 4),
+        k!("GetEnvironmentVariableW", get_environment_variable_w, 3),
     ]
 }
 
@@ -1236,4 +1240,50 @@ pub extern "C" fn find_first_file_ex_w(
 ) -> *mut c_void {
     // INVALID_HANDLE_VALUE
     !0usize as *mut c_void
+}
+
+/// `kernel32!GetTempPath2W(len, buf) -> DWORD`. Fill with "/tmp/".
+pub extern "C" fn get_temp_path2_w(len: u32, buf: *mut u16) -> u32 {
+    let path = b"/tmp/\0";
+    let needed = path.len() as u32;
+    if buf.is_null() || len < needed {
+        return needed;
+    }
+    // SAFETY: caller provides a buffer of at least `len` u16 elements.
+    unsafe {
+        for (i, &b) in path.iter().enumerate() {
+            *buf.add(i) = b as u16;
+        }
+    }
+    needed - 1
+}
+
+/// `kernel32!GetCurrentPackageId(count, buffer) -> LONG`. Return APPMODEL_ERROR_NO_PACKAGE.
+pub extern "C" fn get_current_package_id(_count: *mut u32, _buffer: *mut c_void) -> i32 {
+    15700 // APPMODEL_ERROR_NO_PACKAGE
+}
+
+/// `kernel32!GetTempFileNameA(path, prefix, unique, buf) -> UINT`. Stub.
+pub extern "C" fn get_temp_filename_a(
+    _path: *const u8,
+    _prefix: *const u8,
+    _unique: u32,
+    buf: *mut u8,
+) -> u32 {
+    if buf.is_null() {
+        return 0;
+    }
+    // SAFETY: caller provides a buffer of at least MAX_PATH bytes.
+    unsafe {
+        let name = b"nigg.tmp\0";
+        for (i, &b) in name.iter().enumerate() {
+            *buf.add(i) = b;
+        }
+    }
+    0
+}
+
+/// `kernel32!GetEnvironmentVariableW(name, buf, size) -> DWORD`. Return 0.
+pub extern "C" fn get_environment_variable_w(_name: *const u16, _buf: *mut u16, _size: u32) -> u32 {
+    0
 }
