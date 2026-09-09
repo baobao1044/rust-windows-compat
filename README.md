@@ -28,6 +28,11 @@ shader compiler.
   System-driver bindings written in Rust (Vulkan via `ash`, X11/Wayland, evdev, PipeWire,
   SPIR-V emission via `rspirv`) are used to talk to the host — these are *bindings to Linux
   infrastructure*, not Windows-compatibility code.
+- The TPM 2.0 (`tbs.dll`) and Secure Boot surfaces are **platform-query compatibility
+  shims**, in the same spirit as Wine's registry and version reporting: they answer the
+  standard Windows platform probes so a PE's startup path does not abort. They do **not**
+  forge attestation material, touch a host TPM, or modify firmware state. See
+  [docs/anti-cheat.md](docs/anti-cheat.md) for the full scope statement.
 
 ## Milestone ladder
 
