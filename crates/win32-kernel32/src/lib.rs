@@ -53,6 +53,7 @@ pub mod comctl32;
 pub mod comdlg32;
 pub mod console;
 pub mod crt;
+pub mod d3dcompiler;
 pub mod dllload;
 pub mod env;
 pub mod extras;

@@ -1082,6 +1082,21 @@ fn import_specs() -> Vec<ImportSpec> {
         }
     }
 
+    // Wire in d3dcompiler_47.dll (D3DCompile) — bridges to our HLSL→SPIR-V
+    // compiler so games can compile HLSL shaders at runtime.
+    for e in nigg_win32_kernel32::d3dcompiler::d3d_compiler_exports() {
+        let key = (e.dll.to_string(), e.sym.to_string());
+        if seen.insert(key) {
+            specs.push(ImportSpec {
+                dll: e.dll,
+                sym: e.sym,
+                target: e.ptr,
+                n_args: e.n_args,
+                noreturn: e.noreturn,
+            });
+        }
+    }
+
     // Wire in the extra kernel32/ntdll exports from `nigg-win32-kernel32::extras2`
     // (file/directory ops, console screen-buffer helpers, time conversions, process/handle
     // stubs, disk/volume queries, CompareStringW, RtlGetVersion). These back the import

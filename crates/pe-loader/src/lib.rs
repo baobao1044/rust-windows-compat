@@ -149,6 +149,11 @@ impl PeImage {
 /// Reads the file, parses it, maps + relocates it, resolves imports, and builds the
 /// TEB/PEB and a guest stack. Returns a [`PeImage`] whose [`PeImage::run`] executes it.
 pub fn load(path: &Path) -> Result<PeImage, LoadError> {
+    // Register the EXE's directory so LoadLibrary can find bundled DLLs
+    // (PhysX, lua, assimp, zlib, etc.) that ship alongside the game.
+    if let Some(dir) = path.parent() {
+        nigg_win32_kernel32::dllload::register_exe_dir(dir.to_path_buf());
+    }
     let bytes = std::fs::read(path).map_err(LoadError::Read)?;
     load_bytes(&bytes)
 }

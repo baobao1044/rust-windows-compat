@@ -252,12 +252,25 @@ fn push_candidates(out: &mut Vec<PathBuf>, base: String) {
     }
 }
 
-/// The DLL search directories: `$NIGG_DLL_PATH` entries (if set) then the cwd.
+/// The DLL search directories: the main EXE's directory (set by the PE loader
+/// at load time), then `$NIGG_DLL_PATH` entries (if set), then the cwd.
+static EXE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Register the main EXE's directory so `LoadLibrary` can find bundled DLLs
+/// (PhysX, lua, assimp, zlib, etc.) that ship alongside the game .exe.
+pub fn register_exe_dir(dir: PathBuf) {
+    let _ = EXE_DIR.set(dir);
+}
+
 fn search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    // 1. The main EXE's directory — Windows always searches here first for
+    // bundled DLLs. This is where games put PhysX_64.dll, lua54.dll, etc.
+    if let Some(exe_dir) = EXE_DIR.get() {
+        dirs.push(exe_dir.clone());
+    }
+    // 2. $NIGG_DLL_PATH — a Linux stand-in for the Windows search path.
     if let Some(list) = std::env::var_os("NIGG_DLL_PATH") {
-        // Non-Windows stand-in for the real search path: a list of dirs separated by
-        // `:` (POSIX convention) or `;` (the Windows convention) — both accepted.
         dirs.extend(
             list.to_string_lossy()
                 .split([':', ';'])

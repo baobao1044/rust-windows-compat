@@ -9,6 +9,7 @@ libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 nigg-ntapi = { path = "../ntapi" }
+nigg-hlsl-compiler = { path = "../hlsl-compiler" }
 
 [dev-dependencies]
 tempfile = "3"
