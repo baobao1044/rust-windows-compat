@@ -207,8 +207,9 @@ pub fn load_bytes(bytes: &[u8]) -> Result<PeImage, LoadError> {
             // main EXE, owned by the returned PeImage), so the pointer is stable.
             unsafe { seh::install(pdata_base, count, mapped.base as usize, mapped.size) };
             nigg_win32_kernel32::dllload::register_lookup_function_entry(seh_proxy);
+            nigg_win32_kernel32::dllload::register_virtual_unwind(virtual_unwind_proxy);
             log::debug!(
-                "pe-loader: SEH exception table installed ({count} RUNTIME_FUNCTION entries at RVA {pdata_rva:#x})"
+                "pe-loader: SEH exception table + virtual unwind installed ({count} RUNTIME_FUNCTION entries at RVA {pdata_rva:#x})"
             );
         }
     }
@@ -290,6 +291,43 @@ fn stack_usable() -> usize {
 /// table without a reverse dependency.
 fn seh_proxy(pc: u64) -> *const std::os::raw::c_void {
     seh::lookup_function_entry(pc)
+}
+
+/// Proxy matching `dllload::VirtualUnwindFn`: delegates to `seh::virtual_unwind`
+/// so the kernel32-side `RtlVirtualUnwind` stub can reach the PE loader's
+/// unwind implementation without a reverse dependency.
+fn virtual_unwind_proxy(
+    function_entry: *const std::os::raw::c_void,
+    _image_base: usize,
+    ctx: *mut std::os::raw::c_void,
+    establisher_frame: *mut u64,
+) -> u32 {
+    // The image_base is stored in the EXC_TABLE global inside seh.rs, so we
+    // pass 0 here and let virtual_unwind look it up. Actually, virtual_unwind
+    // takes image_base as a parameter — but the bridge passes 0 from kernel32.
+    // We need to read the real image_base from the global. Let me check.
+    //
+    // Actually, the seh::virtual_unwind function takes image_base as a parameter
+    // and uses it directly. The bridge passes 0. We need to either:
+    // 1. Store image_base in seh.rs and have virtual_unwind use it internally
+    // 2. Or pass it through the bridge
+    //
+    // Option 1 is simpler: modify virtual_unwind to read image_base from the
+    // EXC_TABLE global (which already stores it). The parameter becomes unused.
+    // But that changes the signature...
+    //
+    // Simplest: read image_base from the EXC_TABLE global here and pass it.
+    let image_base = seh::get_image_base().unwrap_or(0);
+    // SAFETY: the caller (kernel32 RtlVirtualUnwind) passes valid pointers from
+    // the guest context.
+    unsafe {
+        seh::virtual_unwind(
+            function_entry as *const seh::RuntimeFunction,
+            image_base,
+            ctx as *mut seh::Context,
+            establisher_frame,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

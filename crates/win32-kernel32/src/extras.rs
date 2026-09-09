@@ -117,17 +117,31 @@ pub extern "C" fn rtl_lookup_function_entry(
     std::ptr::null_mut()
 }
 
-/// `kernel32!RtlVirtualUnwind(...) -> PEXCEPTION_ROUTINE`. Returns NULL (no handler).
+/// `kernel32!RtlVirtualUnwind(...) -> PEXCEPTION_ROUTINE`.
+/// Delegates to the PE loader's SEH implementation via the registered bridge.
 pub extern "C" fn rtl_virtual_unwind(
     _handler_type: u32,
     _exception_code: u32,
     _target_ip: u64,
-    _function_entry: *const c_void,
-    _context: *mut c_void,
+    function_entry: *const c_void,
+    context: *mut c_void,
     _handler_data: *mut *mut c_void,
-    _frame: *mut u64,
+    frame: *mut u64,
 ) -> *mut c_void {
-    std::ptr::null_mut()
+    // The image base is implicit in the RuntimeFunction's RVAs; the PE loader
+    // stored it when installing the exception table. We pass 0 and let the
+    // implementation use its own stored base.
+    let handler_rva = crate::dllload::call_virtual_unwind(
+        function_entry,
+        0, // image_base: the pe-loader side looks it up from its global state
+        context,
+        frame,
+    );
+    if handler_rva != 0 {
+        handler_rva as *mut c_void
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 /// `kernel32!RtlUnwindEx(...) -> void`. Best-effort no-op.

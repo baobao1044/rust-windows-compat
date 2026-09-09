@@ -95,6 +95,37 @@ pub fn call_lookup_function_entry(pc: u64) -> *const c_void {
     }
 }
 
+/// The registered SEH virtual-unwind function: parses UNWIND_INFO and restores
+/// the caller's frame in a CONTEXT. Set by `nigg-pe-loader` at load time.
+pub type VirtualUnwindFn = fn(
+    function_entry: *const c_void,
+    image_base: usize,
+    ctx: *mut c_void,
+    establisher_frame: *mut u64,
+) -> u32;
+
+static VIRTUAL_UNWIND_FN: OnceLock<VirtualUnwindFn> = OnceLock::new();
+
+/// Register the virtual-unwind function. Called by the PE loader after the
+/// main image is mapped and the exception table is installed.
+pub fn register_virtual_unwind(f: VirtualUnwindFn) {
+    let _ = VIRTUAL_UNWIND_FN.set(f);
+}
+
+/// Call the registered virtual-unwind, if installed; returns 0 (no handler)
+/// otherwise.
+pub fn call_virtual_unwind(
+    function_entry: *const c_void,
+    image_base: usize,
+    ctx: *mut c_void,
+    establisher_frame: *mut u64,
+) -> u32 {
+    match VIRTUAL_UNWIND_FN.get() {
+        Some(f) => f(function_entry, image_base, ctx, establisher_frame),
+        None => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LoadLibrary family
 // ---------------------------------------------------------------------------
