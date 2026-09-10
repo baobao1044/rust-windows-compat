@@ -45,6 +45,18 @@ pub fn resolve(imports: &[goblin::pe::import::Import], known: &ImplTable) -> Res
         let dll = imp.dll.to_lowercase();
         let sym = normalize_symbol(&imp.name);
         if let Some(ptr) = known.lookup(&dll, &sym) {
+            // For VCRUNTIME140/MSVCP140, prefer the real DLL from disk over
+            // our stubs — the real MSVC implementations handle C++ exceptions
+            // and memory management correctly, while our no-op stubs cause
+            // heap corruption. Skip the table and try auto-load first.
+            if dll == "vcruntime140.dll" || dll == "vcruntime140_1.dll" || dll == "msvcp140.dll" {
+                let disk_ptr = try_resolve_from_disk(imp.dll, &sym);
+                if let Some(dptr) = disk_ptr {
+                    log::debug!("resolved {dll}!{sym} from real DLL on disk (overriding stub)");
+                    out.resolved.insert((dll.clone(), sym.clone()), dptr);
+                    continue;
+                }
+            }
             out.resolved.insert((dll.clone(), sym.clone()), ptr);
         } else if dll.starts_with("api-ms-win-crt-") {
             // api-ms-win-crt-* are Universal CRT API-set pseudo-DLLs. Their
