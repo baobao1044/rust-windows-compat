@@ -217,7 +217,7 @@ fn try_resolve_from_disk(dll_name: &str, sym: &str) -> Option<FnPtr> {
         // Load the DLL without running DllMain — the exports exist in mapped
         // memory regardless of whether DllMain ran. Running DllMain would fail
         // because the DLL's own imports (kernel32, etc.) have stubs.
-        match crate::dllmod::load_dll_ex(path, false) {
+        match crate::dllmod::load_dll_ex(path, true) {
             Ok(hmodule) => {
                 log::debug!("loaded bundled DLL {dll_name} from {path_str} (hmodule={hmodule:p}, DllMain skipped)");
                 // GetProcAddress: try by name first, then by ordinal.

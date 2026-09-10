@@ -33,7 +33,7 @@ pub fn register_exe_base(base: usize) {
     let _ = EXE_BASE.set(base);
 }
 
-fn exe_base() -> usize {
+pub(crate) fn exe_base() -> usize {
     *EXE_BASE.get().unwrap_or(&0x1_4000_0000)
 }
 

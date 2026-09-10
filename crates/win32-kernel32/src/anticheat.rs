@@ -837,6 +837,20 @@ pub fn anticheat_exports() -> Vec<ExportSpec> {
         k!("GetCurrentPackageId", get_current_package_id, 2),
         k!("GetTempFileNameA", get_temp_filename_a, 4),
         k!("GetEnvironmentVariableW", get_environment_variable_w, 3),
+        k!(
+            "InitializeCriticalSectionEx",
+            initialize_critical_section_ex,
+            3
+        ),
+        k!("SleepConditionVariableCS", sleep_condition_variable_cs, 3),
+        k!("WakeConditionVariable", wake_condition_variable, 1),
+        k!("WakeAllConditionVariable", wake_all_condition_variable, 1),
+        k!(
+            "InitializeConditionVariable",
+            initialize_condition_variable,
+            1
+        ),
+        k!("SleepConditionVariableSRW", sleep_condition_variable_srw, 4),
     ]
 }
 
@@ -1286,4 +1300,41 @@ pub extern "C" fn get_temp_filename_a(
 /// `kernel32!GetEnvironmentVariableW(name, buf, size) -> DWORD`. Return 0.
 pub extern "C" fn get_environment_variable_w(_name: *const u16, _buf: *mut u16, _size: u32) -> u32 {
     0
+}
+
+/// `kernel32!InitializeCriticalSectionEx(cs, spin, flags) -> BOOL`. Returns TRUE.
+pub extern "C" fn initialize_critical_section_ex(
+    _cs: *mut c_void,
+    _spin: u32,
+    _flags: u32,
+) -> c_int {
+    1 // TRUE
+}
+
+/// `kernel32!SleepConditionVariableCS(cv, cs, timeout) -> BOOL`. Returns TRUE.
+pub extern "C" fn sleep_condition_variable_cs(
+    _cv: *mut c_void,
+    _cs: *mut c_void,
+    _timeout: u32,
+) -> c_int {
+    1
+}
+
+/// `kernel32!WakeConditionVariable(cv) -> void`. No-op.
+pub extern "C" fn wake_condition_variable(_cv: *mut c_void) {}
+
+/// `kernel32!WakeAllConditionVariable(cv) -> void`. No-op.
+pub extern "C" fn wake_all_condition_variable(_cv: *mut c_void) {}
+
+/// `kernel32!InitializeConditionVariable(cv) -> void`. No-op.
+pub extern "C" fn initialize_condition_variable(_cv: *mut c_void) {}
+
+/// `kernel32!SleepConditionVariableSRW(cv, lock, timeout, flags) -> BOOL`. Returns TRUE.
+pub extern "C" fn sleep_condition_variable_srw(
+    _cv: *mut c_void,
+    _lock: *mut c_void,
+    _timeout: u32,
+    _flags: u32,
+) -> c_int {
+    1
 }

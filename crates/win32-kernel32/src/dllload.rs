@@ -193,6 +193,29 @@ fn load_with_search(name: &str, run_dll_main: bool) -> *mut c_void {
         set_last_error(ERROR_INVALID_NAME);
         return std::ptr::null_mut();
     }
+
+    // api-ms-win-* pseudo-DLLs don't exist as files — they're aliases for
+    // kernel32. Return the kernel32 fake handle so GetProcAddress can resolve
+    // through our ImplTable. Without this, bundled DLLs' CRT init crashes when
+    // it calls LoadLibrary("api-ms-win-core-fibers-l1-2-1") for FlsAlloc.
+    let name_lower = name.to_lowercase();
+    if name_lower.starts_with("api-ms-win-") {
+        log::debug!(
+            "LoadLibrary({name}): returning kernel32 fake handle (api-ms-win-* pseudo-DLL)"
+        );
+        return (crate::process::exe_base() + 0x1000) as *mut c_void;
+    }
+    // Known DLLs we implement — return the fake handle directly.
+    match name_lower.as_str() {
+        "kernel32.dll" | "kernel32" | "kernelbase.dll" | "kernelbase" => {
+            return (crate::process::exe_base() + 0x1000) as *mut c_void;
+        }
+        "ntdll.dll" | "ntdll" => {
+            return (crate::process::exe_base() + 0x2000) as *mut c_void;
+        }
+        _ => {}
+    }
+
     let Some(loader) = LOAD_DLL_FN.get() else {
         // Loader not registered (bare kernel32 unit tests): keep the "cannot load"
         // behavior loud but non-fatal.
