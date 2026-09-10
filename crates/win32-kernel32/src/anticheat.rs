@@ -861,6 +861,65 @@ pub fn anticheat_exports() -> Vec<ExportSpec> {
         k!("IsValidLocaleName", is_valid_locale_name, 1),
         k!("LCIDToLocaleName", lcid_to_locale_name, 4),
         k!("GetModuleFileNameW", get_module_file_name_w, 3),
+        k!("FlushProcessWriteBuffers", flush_process_write_buffers, 0),
+        k!("CreateSemaphoreExW", create_semaphore_ex_w, 6),
+        k!("CreateEventExW", create_event_ex_w, 4),
+        k!("InitOnceExecuteOnce", init_once_execute_once, 4),
+        k!("CreateThreadpoolWork", create_threadpool_work, 3),
+        k!("SubmitThreadpoolWork", submit_threadpool_work, 1),
+        k!("CloseThreadpoolWork", close_threadpool_work, 1),
+        k!(
+            "FreeLibraryWhenCallbackReturns",
+            free_library_when_callback_returns,
+            2
+        ),
+        k!("RtlCaptureStackBackTrace", rtl_capture_stack_back_trace, 4),
+        k!(
+            "TryAcquireSRWLockExclusive",
+            try_acquire_srw_lock_exclusive,
+            1
+        ),
+        k!("GetNativeSystemInfo", get_native_system_info, 1),
+        k!("GetExitCodeThread", get_exit_code_thread, 2),
+        k!("FormatMessageA", format_message_a, 7),
+        k!("DecodePointer", decode_pointer, 1),
+        k!(
+            "SetFileInformationByHandle",
+            set_file_information_by_handle,
+            4
+        ),
+        // Threadpool + thread priority + misc kernel32 for VCRUNTIME140 DllMain
+        k!("CreateEventA", create_event_a, 4),
+        k!("SetThreadPriority", set_thread_priority, 2),
+        k!("GetThreadPriority", get_thread_priority, 1),
+        ExportSpec {
+            dll: "kernel32.dll",
+            sym: "ExitThread",
+            ptr: exit_thread as *const c_void,
+            n_args: 1,
+            noreturn: true,
+        },
+        k!("TerminateThread", terminate_thread, 2),
+        k!("SetThreadAffinityMask", set_thread_affinity_mask, 2),
+        k!("LCMapStringEx", lc_map_string_ex, 9),
+        k!(
+            "GetFileInformationByHandleEx",
+            get_file_information_by_handle_ex,
+            4
+        ),
+        k!("CreateThreadpoolWait", create_threadpool_wait, 3),
+        k!("SetThreadpoolWait", set_threadpool_wait, 3),
+        k!("CloseThreadpoolWait", close_threadpool_wait, 1),
+        k!("CreateThreadpoolTimer", create_threadpool_timer, 3),
+        k!("SetThreadpoolTimer", set_threadpool_timer, 4),
+        k!(
+            "WaitForThreadpoolTimerCallbacks",
+            wait_for_threadpool_timer_callbacks,
+            2
+        ),
+        k!("CloseThreadpoolTimer", close_threadpool_timer, 1),
+        k!("GetCurrentProcessorNumber", get_current_processor_number, 0),
+        k!("GetModuleFileNameA", get_module_file_name_a, 3),
     ]
 }
 
@@ -1473,5 +1532,250 @@ pub extern "C" fn get_module_file_name_w(_h_module: *mut c_void, buf: *mut u16, 
     unsafe {
         *buf = 0;
     }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// kernel32 functions needed by VCRUNTIME140 DllMain
+// ---------------------------------------------------------------------------
+
+/// `kernel32!FlushProcessWriteBuffers() -> void`. No-op (msync not needed).
+pub extern "C" fn flush_process_write_buffers() {}
+
+/// `kernel32!CreateSemaphoreExW(sa, initial, max, name, flags, access) -> HANDLE`.
+pub extern "C" fn create_semaphore_ex_w(
+    _sa: *const c_void,
+    initial: i32,
+    _max: i32,
+    _name: *const u16,
+    _flags: u32,
+    _access: u32,
+) -> *mut c_void {
+    // Use our ntapi semaphore, but simplified — just return a fake handle
+    if initial < 0 {
+        return std::ptr::null_mut();
+    }
+    make_fake_handle()
+}
+
+/// `kernel32!CreateEventExW(sa, name, flags, access) -> HANDLE`.
+pub extern "C" fn create_event_ex_w(
+    _sa: *const c_void,
+    _name: *const u16,
+    _flags: u32,
+    _access: u32,
+) -> *mut c_void {
+    make_fake_handle()
+}
+
+/// `kernel32!InitOnceExecuteOnce(init, func, ctx, ...) -> BOOL`. Returns TRUE.
+pub extern "C" fn init_once_execute_once(
+    _init: *mut c_void,
+    _func: *const c_void,
+    _ctx: *mut c_void,
+    _ctx2: *mut *mut c_void,
+) -> c_int {
+    1
+}
+
+/// `kernel32!CreateThreadpoolWork(func, ctx, env) -> PTP_WORK`. Return fake handle.
+pub extern "C" fn create_threadpool_work(
+    _func: *const c_void,
+    _ctx: *mut c_void,
+    _env: *const c_void,
+) -> *mut c_void {
+    make_fake_handle()
+}
+
+/// `kernel32!SubmitThreadpoolWork(work) -> void`. No-op.
+pub extern "C" fn submit_threadpool_work(_work: *mut c_void) {}
+
+/// `kernel32!CloseThreadpoolWork(work) -> void`. No-op.
+pub extern "C" fn close_threadpool_work(_work: *mut c_void) {}
+
+/// `kernel32!FreeLibraryWhenCallbackReturns(ctx, hModule) -> void`. No-op.
+pub extern "C" fn free_library_when_callback_returns(_ctx: *mut c_void, _h_module: *mut c_void) {}
+
+/// `kernel32!RtlCaptureStackBackTrace(frames_to_skip, frames_to_capture, buffer, hash) -> WORD`. Return 0.
+pub extern "C" fn rtl_capture_stack_back_trace(
+    _skip: u32,
+    _capture: u32,
+    _buf: *mut *mut c_void,
+    _hash: *mut u32,
+) -> u32 {
+    0
+}
+
+/// `kernel32!TryAcquireSRWLockExclusive(lock) -> BOOLEAN`. Return TRUE.
+pub extern "C" fn try_acquire_srw_lock_exclusive(_lock: *mut c_void) -> c_int {
+    1
+}
+
+/// `kernel32!GetNativeSystemInfo(info) -> void`. Fill SYSTEM_INFO.
+pub extern "C" fn get_native_system_info(info: *mut c_void) {
+    if info.is_null() {
+        return;
+    }
+    // SYSTEM_INFO is 48 bytes on x64
+    // SAFETY: caller provides a valid 48-byte buffer.
+    unsafe {
+        std::ptr::write_bytes(info as *mut u8, 0, 48);
+        // wProcessorArchitecture = 9 (AMD64) at offset 0 (WORD)
+        *(info as *mut u16) = 9;
+        // dwPageSize = 4096 at offset 4
+        *((info as *mut u8).add(4) as *mut u32) = 4096;
+        // dwNumberOfProcessors at offset 40
+        let ncpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as u32;
+        *((info as *mut u8).add(40) as *mut u32) = ncpus;
+    }
+}
+
+/// `kernel32!GetExitCodeThread(h, code) -> BOOL`. Set *code = 0 (still running).
+pub extern "C" fn get_exit_code_thread(_h: *mut c_void, code: *mut u32) -> c_int {
+    if !code.is_null() {
+        unsafe {
+            *code = 0;
+        }
+    }
+    1
+}
+
+/// `kernel32!FormatMessageA(flags, source, msg_id, lang, buf, size, args) -> DWORD`. Return 0.
+pub extern "C" fn format_message_a(
+    _flags: u32,
+    _source: *const c_void,
+    _msg_id: u32,
+    _lang: u32,
+    _buf: *mut u8,
+    _size: u32,
+    _args: *const c_void,
+) -> u32 {
+    0
+}
+
+/// `kernel32!DecodePointer(ptr) -> PTR`. Inverse of EncodePointer — return ptr.
+pub extern "C" fn decode_pointer(ptr: *mut c_void) -> *mut c_void {
+    ptr
+}
+
+/// `kernel32!SetFileInformationByHandle(h, info_class, info, size) -> BOOL`. Return TRUE.
+pub extern "C" fn set_file_information_by_handle(
+    _h: *mut c_void,
+    _info_class: u32,
+    _info: *const c_void,
+    _size: u32,
+) -> c_int {
+    1
+}
+
+/// `kernel32!CreateEventA(sa, manual, initial, name) -> HANDLE`.
+pub extern "C" fn create_event_a(
+    _sa: *const c_void,
+    _manual: c_int,
+    _initial: c_int,
+    _name: *const u8,
+) -> *mut c_void {
+    make_fake_handle()
+}
+
+/// `kernel32!SetThreadPriority(h, priority) -> BOOL`. Return TRUE.
+pub extern "C" fn set_thread_priority(_h: *mut c_void, _priority: c_int) -> c_int {
+    1
+}
+
+/// `kernel32!GetThreadPriority(h) -> int`. Return 0 (normal).
+pub extern "C" fn get_thread_priority(_h: *mut c_void) -> c_int {
+    0
+}
+
+/// `kernel32!ExitThread(code) -> noreturn`. Call libc::_exit.
+pub extern "C" fn exit_thread(_code: u32) -> ! {
+    // SAFETY: _exit never returns.
+    unsafe { libc::_exit(0) }
+}
+
+/// `kernel32!TerminateThread(h, code) -> BOOL`. Return TRUE.
+pub extern "C" fn terminate_thread(_h: *mut c_void, _code: u32) -> c_int {
+    1
+}
+
+/// `kernel32!SetThreadAffinityMask(h, mask) -> DWORD_PTR`. Return 1 (all CPUs).
+pub extern "C" fn set_thread_affinity_mask(_h: *mut c_void, _mask: usize) -> usize {
+    0xFFFF
+}
+
+/// `kernel32!LCMapStringEx(locale, flags, src, src_len, dst, dst_len, version, reserved, custom) -> int`. Return 0.
+pub extern "C" fn lc_map_string_ex(
+    _locale: *const u16,
+    _flags: u32,
+    _src: *const u16,
+    _src_len: c_int,
+    _dst: *mut u16,
+    _dst_len: c_int,
+    _version: *const c_void,
+    _reserved: *mut c_void,
+    _custom: usize,
+) -> c_int {
+    0
+}
+
+/// `kernel32!GetFileInformationByHandleEx(h, class, info, size) -> BOOL`. Return TRUE.
+pub extern "C" fn get_file_information_by_handle_ex(
+    _h: *mut c_void,
+    _class: u32,
+    _info: *mut c_void,
+    _size: u32,
+) -> c_int {
+    1
+}
+
+/// `kernel32!CreateThreadpoolWait(func, ctx, env) -> PTP_WAIT`. Return fake handle.
+pub extern "C" fn create_threadpool_wait(
+    _func: *const c_void,
+    _ctx: *mut c_void,
+    _env: *const c_void,
+) -> *mut c_void {
+    make_fake_handle()
+}
+
+/// `kernel32!SetThreadpoolWait(wait, h, time) -> void`. No-op.
+pub extern "C" fn set_threadpool_wait(_wait: *mut c_void, _h: *mut c_void, _time: *const c_void) {}
+
+/// `kernel32!CloseThreadpoolWait(wait) -> void`. No-op.
+pub extern "C" fn close_threadpool_wait(_wait: *mut c_void) {}
+
+/// `kernel32!CreateThreadpoolTimer(func, ctx, env) -> PTP_TIMER`. Return fake handle.
+pub extern "C" fn create_threadpool_timer(
+    _func: *const c_void,
+    _ctx: *mut c_void,
+    _env: *const c_void,
+) -> *mut c_void {
+    make_fake_handle()
+}
+
+/// `kernel32!SetThreadpoolTimer(timer, due, period, window) -> void`. No-op.
+pub extern "C" fn set_threadpool_timer(
+    _timer: *mut c_void,
+    _due: *const c_void,
+    _period: u32,
+    _window: u32,
+) {
+}
+
+/// `kernel32!WaitForThreadpoolTimerCallbacks(timer, cancel) -> void`. No-op.
+pub extern "C" fn wait_for_threadpool_timer_callbacks(_timer: *mut c_void, _cancel: c_int) {}
+
+/// `kernel32!CloseThreadpoolTimer(timer) -> void`. No-op.
+pub extern "C" fn close_threadpool_timer(_timer: *mut c_void) {}
+
+/// `kernel32!GetCurrentProcessorNumber() -> DWORD`. Return 0.
+pub extern "C" fn get_current_processor_number() -> u32 {
+    0
+}
+
+/// `kernel32!GetModuleFileNameA(hModule, buf, size) -> DWORD`. Return 0.
+pub extern "C" fn get_module_file_name_a(_h: *mut c_void, _buf: *mut u8, _size: u32) -> u32 {
     0
 }

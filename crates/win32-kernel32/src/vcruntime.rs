@@ -356,3 +356,44 @@ pub fn vcruntime_exports() -> Vec<ExportSpec> {
         ),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// VCRUNTIME140 internal CRT state (not exported by all versions)
+// ---------------------------------------------------------------------------
+
+/// `VCRUNTIME140!__current_exception_context` — thread-local exception context.
+pub extern "C" fn vcr_current_exception_context() -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `VCRUNTIME140!__uncaught_exceptions` — count of uncaught exceptions.
+pub extern "C" fn vcr_uncaught_exceptions() -> i32 {
+    0
+}
+
+/// `VCRUNTIME140!__uncaught_exception` — boolean: any uncaught?
+pub extern "C" fn vcr_uncaught_exception() -> i32 {
+    0
+}
+
+/// `VCRUNTIME140!__std_terminate` — calls std::terminate.
+pub extern "C" fn vcr_std_terminate() -> ! {
+    log::error!("vcruntime: __std_terminate called");
+    // SAFETY: abort never returns.
+    unsafe { libc::abort() }
+}
+
+/// `VCRUNTIME140!__AdjustPointer` — adjusts a pointer (returns it unchanged).
+pub extern "C" fn vcr_adjust_pointer(ptr: *mut c_void, _adj: isize) -> *mut c_void {
+    ptr
+}
+
+/// `VCRUNTIME140!__current_exception` — current exception pointer.
+pub extern "C" fn vcr_current_exception() -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `VCRUNTIME140_1!__CxxFrameHandler4` — SEH frame handler (version 4).
+pub extern "C" fn vcr_cxx_frame_handler4() -> i32 {
+    0 // ExceptionContinueSearch
+}
