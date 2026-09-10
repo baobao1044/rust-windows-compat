@@ -391,6 +391,17 @@ extern "C" fn create_window_ex_w(
         ));
     });
     log::trace!("user32!CreateWindowExW('{cname}') -> {hwnd:p}");
+
+    // Windows sends WM_CREATE, WM_SIZE, WM_MOVE, and WM_SHOWWINDOW to the
+    // window procedure during CreateWindowExW. Without WM_CREATE, the game's
+    // WndProc never initializes its state and crashes on the first message.
+    if !wnd_proc.is_null() {
+        send_message_internal(hwnd, WM_CREATE, 0, 0);
+        send_message_internal(hwnd, 0x0005, 0, 0); // WM_SIZE
+        send_message_internal(hwnd, 0x0003, 0, 0); // WM_MOVE
+        send_message_internal(hwnd, 0x0018, 1, 0); // WM_SHOWWINDOW (TRUE)
+    }
+
     hwnd
 }
 

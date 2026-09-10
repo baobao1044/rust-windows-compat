@@ -851,6 +851,16 @@ pub fn anticheat_exports() -> Vec<ExportSpec> {
             1
         ),
         k!("SleepConditionVariableSRW", sleep_condition_variable_srw, 4),
+        k!("AreFileApisANSI", are_file_apis_ansi, 0),
+        k!("CompareStringEx", compare_string_ex, 9),
+        k!("EnumSystemLocalesEx", enum_system_locales_ex, 4),
+        k!("GetDateFormatEx", get_date_format_ex, 8),
+        k!("GetLocaleInfoEx", get_locale_info_ex, 4),
+        k!("GetTimeFormatEx", get_time_format_ex, 6),
+        k!("GetUserDefaultLocaleName", get_user_default_locale_name, 2),
+        k!("IsValidLocaleName", is_valid_locale_name, 1),
+        k!("LCIDToLocaleName", lcid_to_locale_name, 4),
+        k!("GetModuleFileNameW", get_module_file_name_w, 3),
     ]
 }
 
@@ -1337,4 +1347,131 @@ pub extern "C" fn sleep_condition_variable_srw(
     _flags: u32,
 ) -> c_int {
     1
+}
+
+// ---------------------------------------------------------------------------
+// Locale functions (GetProcAddress resolves these for CRT init)
+// ---------------------------------------------------------------------------
+
+/// `kernel32!AreFileApisANSI() -> BOOL`. Return TRUE (ANSI file APIs).
+pub extern "C" fn are_file_apis_ansi() -> c_int {
+    1
+}
+
+/// `kernel32!CompareStringEx(locale, flags, s1, l1, s2, l2) -> int`. Return 2 (equal).
+pub extern "C" fn compare_string_ex(
+    _locale: *const u16,
+    _flags: u32,
+    _s1: *const u16,
+    _l1: c_int,
+    _s2: *const u16,
+    _l2: c_int,
+    _info: *const c_void,
+    _reserved: *mut c_void,
+    _custom: usize,
+) -> c_int {
+    2
+}
+
+/// `kernel32!EnumSystemLocalesEx(callback, flags, context, reserved) -> BOOL`. Return TRUE.
+pub extern "C" fn enum_system_locales_ex(
+    _callback: *mut c_void,
+    _flags: u32,
+    _context: *const c_void,
+    _reserved: *const c_void,
+) -> c_int {
+    1
+}
+
+/// `kernel32!GetDateFormatEx(locale, flags, date, format, buf, size, calendar, reserved) -> int`. Return 0.
+pub extern "C" fn get_date_format_ex(
+    _locale: *const u16,
+    _flags: u32,
+    _date: *const c_void,
+    _fmt: *const u16,
+    _buf: *mut u16,
+    _size: c_int,
+    _calendar: *const c_void,
+    _reserved: *const c_void,
+) -> c_int {
+    0
+}
+
+/// `kernel32!GetLocaleInfoEx(locale, lctype, buf, size) -> int`. Return 0.
+pub extern "C" fn get_locale_info_ex(
+    _locale: *const u16,
+    _lctype: u32,
+    _buf: *mut u16,
+    _size: c_int,
+) -> c_int {
+    0
+}
+
+/// `kernel32!GetTimeFormatEx(locale, flags, date, fmt, buf, size) -> int`. Return 0.
+pub extern "C" fn get_time_format_ex(
+    _locale: *const u16,
+    _flags: u32,
+    _date: *const c_void,
+    _fmt: *const u16,
+    _buf: *mut u16,
+    _size: c_int,
+) -> c_int {
+    0
+}
+
+/// `kernel32!GetUserDefaultLocaleName(buf, size) -> int`. Fill "en-US".
+pub extern "C" fn get_user_default_locale_name(buf: *mut u16, size: c_int) -> c_int {
+    let name = "en-US\0";
+    let needed = name.encode_utf16().count() as c_int;
+    if buf.is_null() || size < needed {
+        return needed;
+    }
+    // SAFETY: caller provides a buffer of `size` u16 elements.
+    unsafe {
+        for (i, ch) in name.encode_utf16().enumerate() {
+            *buf.add(i) = ch;
+        }
+    }
+    needed - 1
+}
+
+/// `kernel32!IsValidLocaleName(name) -> BOOL`. Return TRUE for "en-US".
+pub extern "C" fn is_valid_locale_name(name: *const u16) -> c_int {
+    if name.is_null() {
+        return 0;
+    }
+    1 // Accept any locale name as valid
+}
+
+/// `kernel32!LCIDToLocaleName(lcid, buf, size, flags) -> int`. Fill "en-US".
+pub extern "C" fn lcid_to_locale_name(
+    _lcid: u32,
+    buf: *mut u16,
+    size: c_int,
+    _flags: u32,
+) -> c_int {
+    let name = "en-US\0";
+    let needed = name.encode_utf16().count() as c_int;
+    if buf.is_null() || size < needed {
+        return needed;
+    }
+    // SAFETY: caller provides a buffer of `size` u16 elements.
+    unsafe {
+        for (i, ch) in name.encode_utf16().enumerate() {
+            *buf.add(i) = ch;
+        }
+    }
+    needed - 1
+}
+
+/// `kernel32!GetModuleFileNameW(hModule, buf, size) -> DWORD`. Return 0 (empty).
+pub extern "C" fn get_module_file_name_w(_h_module: *mut c_void, buf: *mut u16, _size: u32) -> u32 {
+    if buf.is_null() {
+        return 0;
+    }
+    // SAFETY: caller provides a buffer.
+    unsafe {
+        *buf = 0;
+    }
+    0
 }
